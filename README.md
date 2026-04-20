@@ -1,3 +1,5 @@
+[![pipeline status](https://git.hxgroup.com/hexops/homelander/badges/master/pipeline.svg)](https://git.hxgroup.com/hexops/homelander/-/commits/master)
+
 ![Homelander](assets/homelander.png)
 
 # Homelander
