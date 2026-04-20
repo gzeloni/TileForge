@@ -1,0 +1,33 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: homelander-redis
+    restart: unless-stopped
+
+  homelander:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: homelander:latest
+    container_name: homelander
+    ports:
+      - "3502:3502"
+    restart: unless-stopped
+    depends_on:
+      - redis
+    env_file: .env
+    volumes:
+      - /mnt/fshex/homelander_maps:/osm_maps
+
+  homelander-worker:
+    image: homelander:latest
+    container_name: homelander-worker
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - RQ_QUEUE_NAME=homelander-maps
+    command: ["rq", "worker", "--url", "redis://redis:6379/0", "homelander-maps"]
+    volumes:
+      - /mnt/fshex/homelander_maps:/osm_maps
