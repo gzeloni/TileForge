@@ -116,7 +116,7 @@ class InlineMapJobService:
         self.state_store = InMemoryJobStateStore()
 
     def submit_job(self, area: MapArea) -> MapJobAcceptedResponse:
-        source, cache_key, _ = self.map_service.prepare(area)
+        source, effective_area, cache_key, package_dir = self.map_service.prepare(area)
         active_job_id = self.state_store.get_active_job_id(cache_key)
         if active_job_id:
             existing = self.state_store.get_job(active_job_id)
@@ -142,11 +142,9 @@ class InlineMapJobService:
             try:
                 result = self.map_service.build_prepared(
                     source=source,
-                    area=area,
+                    area=effective_area,
                     cache_key=cache_key,
-                    package_dir=self.map_service.cache_store.package_coordinates(
-                        source, area, self.map_service.pipeline_version
-                    )[1],
+                    package_dir=package_dir,
                     reporter=reporter,
                 )
                 self.state_store.set_result(job_id, result.model_dump(mode="json"))
@@ -291,7 +289,7 @@ class RQMapJobService:
         self.state_store = state_store
 
     def submit_job(self, area: MapArea) -> MapJobAcceptedResponse:
-        source, cache_key, package_dir = self.map_service.prepare(area)
+        source, effective_area, cache_key, package_dir = self.map_service.prepare(area)
 
         if self.map_service.cache_store.is_ready(package_dir):
             job_id = f"cache-{cache_key}"
@@ -377,10 +375,10 @@ def run_map_job(job_id: str, area_payload: dict, cache_key: str, source_id: str)
         )
 
     try:
-        source, prepared_cache_key, package_dir = map_service.prepare(area)
+        source, effective_area, prepared_cache_key, package_dir = map_service.prepare(area)
         result = map_service.build_prepared(
             source=source,
-            area=area,
+            area=effective_area,
             cache_key=prepared_cache_key,
             package_dir=package_dir,
             reporter=reporter,

@@ -17,6 +17,7 @@ from app.services.maps import (
     CompositeRegionPackageBuilder,
     MapService,
     SourceRegistry,
+    SourceDefinition,
     build_default_service,
     ensure_sources_manifest,
 )
@@ -147,8 +148,84 @@ class CacheStoreTests(unittest.TestCase):
             self.assertEqual(removed, 1)
             self.assertFalse(package_dir.exists())
 
+    def test_reuses_containing_cached_package_within_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = CacheStore(
+                root / "cache",
+                ttl=timedelta(hours=12),
+                bbox_offset=0.02,
+            )
+            package_dir = root / "cache" / "south-america" / "abc"
+            package_dir.mkdir(parents=True)
+            (package_dir / "region.osm.pbf").write_bytes(b"pbf")
+            (package_dir / "map.mbtiles").write_bytes(b"mbtiles")
+            (package_dir / "graph.json").write_text("{}", encoding="utf-8")
+            (package_dir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "created_at": datetime.now(UTC).isoformat(),
+                        "expires_at": (datetime.now(UTC) + timedelta(hours=12)).isoformat(),
+                        "bbox": {
+                            "west": -46.70,
+                            "south": -23.62,
+                            "east": -46.56,
+                            "north": -23.50,
+                        },
+                        "artifacts": {
+                            "region_pbf": "region.osm.pbf",
+                            "mbtiles": "map.mbtiles",
+                            "graph": "graph.json",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            reusable = store.find_reusable_package(
+                source_id="south-america",
+                area=MapArea(west=-46.70, south=-23.62, east=-46.56, north=-23.51),
+            )
+
+            self.assertEqual(reusable, package_dir)
+
+    def test_snaps_nearby_bboxes_to_same_package_coordinates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = CacheStore(
+                root / "cache",
+                ttl=timedelta(hours=12),
+                bbox_grid=0.02,
+            )
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"source")
+            source = SourceDefinition(
+                source_id="south-america",
+                path=source_path,
+                west=-92.0,
+                south=-57.0,
+                east=-27.0,
+                north=15.0,
+            )
+
+            first_key, first_dir = store.package_coordinates(
+                source=source,
+                area=MapArea(west=-46.70, south=-23.62, east=-46.56, north=-23.50),
+                pipeline_version="v1",
+            )
+            second_key, second_dir = store.package_coordinates(
+                source=source,
+                area=MapArea(west=-46.70, south=-23.62, east=-46.56, north=-23.51),
+                pipeline_version="v1",
+            )
+
+            self.assertEqual(first_key, second_key)
+            self.assertEqual(first_dir, second_dir)
+
 
 class MapApiTests(unittest.TestCase):
+    API_KEY = "test-api-key"
+
     def test_post_submits_background_job_and_exposes_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -185,7 +262,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service))
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
             payload = {
                 "west": -49.5,
                 "south": -25.7,
@@ -193,11 +270,18 @@ class MapApiTests(unittest.TestCase):
                 "north": -25.2,
             }
 
-            submitted = client.post("/api/map", json=payload)
+            submitted = client.post(
+                "/api/map",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
             job_id = submitted.json()["job_id"]
             status = None
             for _ in range(10):
-                status = client.get(f"/api/map/jobs/{job_id}")
+                status = client.get(
+                    f"/api/map/jobs/{job_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
                 if status.json()["status"] == "succeeded":
                     break
 
@@ -243,7 +327,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service))
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
             payload = {
                 "west": -49.5,
                 "south": -25.7,
@@ -251,7 +335,12 @@ class MapApiTests(unittest.TestCase):
                 "north": -25.2,
             }
 
-            with client.stream("POST", "/api/map/stream", json=payload) as response:
+            with client.stream(
+                "POST",
+                "/api/map/stream",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            ) as response:
                 events = [json.loads(line) for line in response.iter_lines() if line]
 
             self.assertEqual(response.status_code, 200)
@@ -260,6 +349,219 @@ class MapApiTests(unittest.TestCase):
             self.assertTrue(
                 any(event["event"] == "progress" and event["step"] == "extract" for event in events)
             )
+
+    def test_rejects_requests_without_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+
+            response = client.post(
+                "/api/map",
+                json={
+                    "west": -49.5,
+                    "south": -25.7,
+                    "east": -49.0,
+                    "north": -25.2,
+                },
+            )
+
+            self.assertEqual(response.status_code, 401)
+
+    def test_reuses_larger_cached_bbox_for_nearby_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12), bbox_offset=0.02)
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+
+            first = client.post(
+                "/api/map",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.50,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            first_job_id = first.json()["job_id"]
+            for _ in range(10):
+                first_status = client.get(
+                    f"/api/map/jobs/{first_job_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if first_status.json()["status"] == "succeeded":
+                    break
+
+            second = client.post(
+                "/api/map",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.51,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            second_job_id = second.json()["job_id"]
+            for _ in range(10):
+                second_status = client.get(
+                    f"/api/map/jobs/{second_job_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if second_status.json()["status"] == "succeeded":
+                    break
+
+            self.assertEqual(builder.calls, 1)
+            self.assertTrue(second_status.json()["result"]["cached"])
+
+    def test_reuses_same_snapped_grid_without_reprocessing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(
+                root / "cache",
+                ttl=timedelta(hours=12),
+                bbox_offset=0.0,
+                bbox_grid=0.02,
+            )
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+
+            first = client.post(
+                "/api/map",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.50,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            first_job_id = first.json()["job_id"]
+            for _ in range(10):
+                first_status = client.get(
+                    f"/api/map/jobs/{first_job_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if first_status.json()["status"] == "succeeded":
+                    break
+
+            second = client.post(
+                "/api/map",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.51,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            second_job_id = second.json()["job_id"]
+            for _ in range(10):
+                second_status = client.get(
+                    f"/api/map/jobs/{second_job_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if second_status.json()["status"] == "succeeded":
+                    break
+
+            self.assertEqual(builder.calls, 1)
+            self.assertTrue(second_status.json()["result"]["cached"])
 
 
 class CompositeRegionPackageBuilderTests(unittest.TestCase):

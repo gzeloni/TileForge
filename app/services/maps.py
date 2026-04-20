@@ -1,6 +1,7 @@
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -123,9 +124,17 @@ class SourceRegistry:
 
 
 class CacheStore:
-    def __init__(self, root: Path, ttl: timedelta) -> None:
+    def __init__(
+        self,
+        root: Path,
+        ttl: timedelta,
+        bbox_offset: float = 0.0,
+        bbox_grid: float = 0.0,
+    ) -> None:
         self.root = root
         self.ttl = ttl
+        self.bbox_offset = bbox_offset
+        self.bbox_grid = bbox_grid
 
     def package_coordinates(
         self,
@@ -133,7 +142,8 @@ class CacheStore:
         area: MapArea,
         pipeline_version: str,
     ) -> tuple[str, Path]:
-        bbox = _normalized_bbox(area)
+        canonical_area = self.canonicalize_area(area, source)
+        bbox = _normalized_bbox(canonical_area)
         digest = hashlib.sha256(
             json.dumps(
                 {
@@ -151,6 +161,17 @@ class CacheStore:
         )
         return digest, self.root / source.source_id / f"{digest}__{slug}"
 
+    def canonicalize_area(self, area: MapArea, source: SourceDefinition) -> MapArea:
+        if self.bbox_grid <= 0:
+            return area
+
+        west = max(source.west, _snap_down(area.west, self.bbox_grid))
+        south = max(source.south, _snap_down(area.south, self.bbox_grid))
+        east = min(source.east, _snap_up(area.east, self.bbox_grid))
+        north = min(source.north, _snap_up(area.north, self.bbox_grid))
+
+        return MapArea(west=west, south=south, east=east, north=north)
+
     def cleanup(self) -> int:
         if not self.root.exists():
             return 0
@@ -165,6 +186,29 @@ class CacheStore:
 
     def read_meta(self, package_dir: Path) -> dict:
         return json.loads((package_dir / "meta.json").read_text(encoding="utf-8"))
+
+    def find_reusable_package(self, source_id: str, area: MapArea) -> Path | None:
+        source_root = self.root / source_id
+        if not source_root.exists():
+            return None
+
+        best_match: tuple[float, Path] | None = None
+        for meta_path in source_root.glob("*/meta.json"):
+            package_dir = meta_path.parent
+            if not self.is_ready(package_dir):
+                continue
+            meta = self.read_meta(package_dir)
+            bbox = meta.get("bbox")
+            if not bbox:
+                continue
+            if not _bbox_contains_with_offset(bbox, area, self.bbox_offset):
+                continue
+
+            area_size = (bbox["east"] - bbox["west"]) * (bbox["north"] - bbox["south"])
+            if best_match is None or area_size < best_match[0]:
+                best_match = (area_size, package_dir)
+
+        return best_match[1] if best_match else None
 
     def is_ready(self, package_dir: Path) -> bool:
         meta_path = package_dir / "meta.json"
@@ -313,23 +357,34 @@ class MapService:
         self.pipeline_version = pipeline_version
 
     def build_map(self, area: MapArea, reporter=None) -> MapPackageResponse:
-        source, cache_key, package_dir = self.prepare(area)
+        source, effective_area, cache_key, package_dir = self.prepare(area)
         return self.build_prepared(
             source=source,
-            area=area,
+            area=effective_area,
             cache_key=cache_key,
             package_dir=package_dir,
             reporter=reporter,
         )
 
-    def prepare(self, area: MapArea) -> tuple[SourceDefinition, str, Path]:
+    def prepare(self, area: MapArea) -> tuple[SourceDefinition, MapArea, str, Path]:
         source = self.source_registry.resolve(area)
+        canonical_area = self.cache_store.canonicalize_area(area, source)
         cache_key, package_dir = self.cache_store.package_coordinates(
             source=source,
-            area=area,
+            area=canonical_area,
             pipeline_version=self.pipeline_version,
         )
-        return source, cache_key, package_dir
+        reusable_package_dir = self.cache_store.find_reusable_package(source.source_id, canonical_area)
+        if reusable_package_dir is not None:
+            reusable_meta = self.cache_store.read_meta(reusable_package_dir)
+            reusable_bbox = reusable_meta["bbox"]
+            return (
+                source,
+                MapArea(**reusable_bbox),
+                reusable_meta["cache_key"],
+                reusable_package_dir,
+            )
+        return source, canonical_area, cache_key, package_dir
 
     def build_prepared(
         self,
@@ -358,7 +413,7 @@ class MapService:
 
             try:
                 self.package_builder.build(source, area, build_dir, reporter=reporter)
-                self._write_meta(cache_key, source, build_dir)
+                self._write_meta(cache_key, source, area, build_dir)
                 self.cache_store.promote(build_dir, package_dir)
             except Exception:
                 self.cache_store.remove_build_dir(build_dir)
@@ -371,7 +426,13 @@ class MapService:
                 cached=False,
             )
 
-    def _write_meta(self, cache_key: str, source: SourceDefinition, package_dir: Path) -> None:
+    def _write_meta(
+        self,
+        cache_key: str,
+        source: SourceDefinition,
+        area: MapArea,
+        package_dir: Path,
+    ) -> None:
         created_at = datetime.now(UTC)
         meta = {
             "cache_key": cache_key,
@@ -380,6 +441,12 @@ class MapService:
             "pipeline_version": self.pipeline_version,
             "source_id": source.source_id,
             "source_signature": source.signature(),
+            "bbox": {
+                "west": area.west,
+                "south": area.south,
+                "east": area.east,
+                "north": area.north,
+            },
             "artifacts": {
                 "region_pbf": "region.osm.pbf",
                 "mbtiles": "map.mbtiles",
@@ -417,6 +484,8 @@ def build_default_service() -> MapService:
         os.getenv("SOURCES_MANIFEST", str(maps_root / "sources" / "manifest.json"))
     )
     ttl_hours = int(os.getenv("CACHE_TTL_HOURS", "12"))
+    bbox_offset = float(os.getenv("CACHE_BBOX_OFFSET", "0.02"))
+    bbox_grid = float(os.getenv("CACHE_BBOX_GRID", "0.02"))
     pipeline_version = os.getenv("PIPELINE_VERSION", "v1")
     tilemaker_threads = os.getenv("TILEMAKER_THREADS", str(max(1, min(4, os.cpu_count() or 1))))
     tilemaker_command = [
@@ -444,7 +513,12 @@ def build_default_service() -> MapService:
     )
     return MapService(
         source_registry=source_registry,
-        cache_store=CacheStore(maps_root / "cache", ttl=timedelta(hours=ttl_hours)),
+        cache_store=CacheStore(
+            maps_root / "cache",
+            ttl=timedelta(hours=ttl_hours),
+            bbox_offset=bbox_offset,
+            bbox_grid=bbox_grid,
+        ),
         package_builder=CompositeRegionPackageBuilder(
             extractor=OsmiumRegionExtractor(binary=os.getenv("OSMIUM_BINARY", "osmium")),
             graph_builder=GraphBuilder(),
@@ -537,3 +611,24 @@ def _registry_matches_filesystem(registry: SourceRegistry) -> bool:
         if source.signature_override and source.signature_override != source.signature():
             return False
     return True
+
+
+def _bbox_contains_with_offset(bbox: dict, area: MapArea, offset: float) -> bool:
+    return (
+        bbox["west"] <= area.west
+        and bbox["south"] <= area.south
+        and bbox["east"] >= area.east
+        and bbox["north"] >= area.north
+        and (area.west - bbox["west"]) <= offset
+        and (area.south - bbox["south"]) <= offset
+        and (bbox["east"] - area.east) <= offset
+        and (bbox["north"] - area.north) <= offset
+    )
+
+
+def _snap_down(value: float, grid: float) -> float:
+    return round(math.floor(value / grid) * grid, 6)
+
+
+def _snap_up(value: float, grid: float) -> float:
+    return round(math.ceil(value / grid) * grid, 6)

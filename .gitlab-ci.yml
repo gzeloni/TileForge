@@ -1,0 +1,24 @@
+image: python:3.13-slim-bookworm
+
+stages:
+  - test
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PYTHONUNBUFFERED: "1"
+
+cache:
+  paths:
+    - .cache/pip
+
+before_script:
+  - apt-get update
+  - apt-get install -y --no-install-recommends osmium-tool
+  - rm -rf /var/lib/apt/lists/*
+  - python -m pip install --upgrade pip
+  - pip install -r requirements.txt
+
+test:
+  stage: test
+  script:
+    - python -m unittest discover -s tests -v
