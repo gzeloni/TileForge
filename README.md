@@ -6,7 +6,7 @@
 
 Homelander is a regional map packaging API for offline/mobile applications.
 
-It receives a bounding box (`west`, `south`, `east`, `north`), selects the correct South/Central America `.osm.pbf` source, extracts the requested region, generates a vector tile package (`.mbtiles`), builds a road graph (`graph.json`), and caches the result on disk.
+It receives a bounding box (`west`, `south`, `east`, `north`) plus `minZoom`, selects the correct South/Central America `.osm.pbf` source, extracts the requested region, generates a vector tile package (`.mbtiles`), builds a road graph (`graph.json`), and caches the result on disk.
 
 The system is designed for repeated regional requests where the same area may be requested multiple times within a short time window.
 
@@ -19,7 +19,7 @@ It solves four operational problems:
 - It turns raw Geofabrik `.osm.pbf` extracts into application-ready regional packages.
 - It avoids reprocessing the same area over and over by caching builds for a limited TTL.
 - It keeps the web API responsive by pushing heavy generation work to a queue worker.
-- It exposes job status and streaming progress so clients do not wait blindly for long builds.
+- It exposes stable package status, artifact download endpoints, and streaming progress so clients do not wait blindly for long builds.
 
 ## Output
 
@@ -49,13 +49,13 @@ Main tooling:
 
 ## High-Level Flow
 
-1. Client submits a bounding box to `POST /api/map`.
+1. Client submits a bounding box and `minZoom` to `POST /api/map/packages`.
 2. API validates the request and resolves the matching source extract.
-3. API enqueues a background job and returns `202 Accepted` with a `job_id`.
+3. API enqueues or reuses a package build and returns `202 Accepted` with a stable `package_id`.
 4. Worker extracts the region with `osmium extract`.
 5. Worker builds `graph.json` from the regional `.osm.pbf`.
-6. Worker generates `map.mbtiles` with `tilemaker --bbox ...`.
-7. Package is written to cache and exposed through job status/result.
+6. Worker generates `map.mbtiles` with `tilemaker --bbox ...` and a generated config whose `settings.minzoom` matches the request.
+7. Package is written to cache and exposed through package status and artifact endpoints.
 
 ## Source Management
 
@@ -76,6 +76,7 @@ If the manifest does not exist, the container bootstraps it automatically by sca
 Cache entries are keyed by:
 
 - normalized bounding box
+- requested `minZoom`
 - source id
 - source signature
 - pipeline version
@@ -86,18 +87,25 @@ This keeps repeated requests cheap while allowing the cache to be discarded aggr
 
 ## API
 
-### Submit a job
+All endpoints require:
 
-`POST /api/map`
+```http
+Authorization: Bearer <API_KEY>
+```
+
+### Create or reuse a package
+
+`POST /api/map/packages`
 
 Request body:
 
 ```json
 {
-  "west": -49.31,
-  "south": -25.49,
-  "east": -49.23,
-  "north": -25.42
+  "west": -46.70,
+  "south": -23.62,
+  "east": -46.56,
+  "north": -23.50,
+  "minZoom": 5
 }
 ```
 
@@ -105,30 +113,66 @@ Response:
 
 ```json
 {
-  "job_id": "b5d3...",
+  "package_id": "9f3c2a8e",
   "status": "queued",
-  "cache_key": "9f3c2a8e",
-  "source_id": "south-america-latest"
+  "source_id": "south-america-latest",
+  "job_id": "b5d3...",
+  "expires_at": null,
+  "artifacts": {
+    "region_pbf": "/api/map/packages/9f3c2a8e/artifacts/region_pbf",
+    "mbtiles": "/api/map/packages/9f3c2a8e/artifacts/mbtiles",
+    "graph": "/api/map/packages/9f3c2a8e/artifacts/graph",
+    "meta": "/api/map/packages/9f3c2a8e/artifacts/meta"
+  }
 }
 ```
 
-### Poll job status
+`package_id` is the stable identifier clients should keep.
 
-`GET /api/map/jobs/{job_id}`
+### Poll package status
 
-Returns queued/running/succeeded/failed plus final package metadata when available.
+`GET /api/map/packages/{package_id}`
+
+Returns:
+
+- `queued`
+- `building`
+- `ready`
+- `failed`
+
+plus artifact URLs when the package is ready.
+
+### Download artifacts
+
+- `GET /api/map/packages/{package_id}/artifacts/mbtiles`
+- `GET /api/map/packages/{package_id}/artifacts/graph`
+- `GET /api/map/packages/{package_id}/artifacts/meta`
+- `GET /api/map/packages/{package_id}/artifacts/region_pbf`
+
+These are the public download URLs. Clients should not attempt to access internal server paths such as `/osm_maps/cache/...`.
 
 ### Stream progress for a new job
 
 `POST /api/map/stream`
 
-Returns newline-delimited JSON (`application/x-ndjson`).
+Returns newline-delimited JSON (`application/x-ndjson`). This remains available for submit-and-stream flows.
 
-### Stream progress for an existing job
+### Stream progress for an existing package
 
-`GET /api/map/jobs/{job_id}/stream`
+`GET /api/map/packages/{package_id}/stream`
 
-This endpoint is useful when the client first submits a job, then attaches to progress later.
+This endpoint is useful when the client first submits a package request, then attaches to progress later.
+
+### Legacy compatibility
+
+The older job-based endpoints still exist for compatibility:
+
+- `POST /api/map`
+- `GET /api/map/jobs/{job_id}`
+- `GET /api/map/jobs/{job_id}/stream`
+- `GET /api/map/jobs/{job_id}/artifacts/{artifact_name}`
+
+They should not be the primary integration target for new clients.
 
 ## Progress Model
 
@@ -162,14 +206,32 @@ docker compose logs -f homelander-worker
 Submit a job:
 
 ```bash
-curl -X POST http://localhost:3502/api/map \
+curl -X POST http://localhost:3502/api/map/packages \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
   -d '{
     "west": -46.70,
     "south": -23.62,
     "east": -46.56,
-    "north": -23.50
+    "north": -23.50,
+    "minZoom": 5
   }'
+```
+
+Poll package status:
+
+```bash
+curl -H 'Authorization: Bearer YOUR_API_KEY' \
+  http://localhost:3502/api/map/packages/PACKAGE_ID
+```
+
+Download MBTiles:
+
+```bash
+curl -L \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  http://localhost:3502/api/map/packages/PACKAGE_ID/artifacts/mbtiles \
+  -o map.mbtiles
 ```
 
 Stream progress:
@@ -177,11 +239,13 @@ Stream progress:
 ```bash
 curl -N -X POST http://localhost:3502/api/map/stream \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
   -d '{
     "west": -46.70,
     "south": -23.62,
     "east": -46.56,
-    "north": -23.50
+    "north": -23.50,
+    "minZoom": 5
   }'
 ```
 
@@ -191,7 +255,9 @@ curl -N -X POST http://localhost:3502/api/map/stream \
 - The API process does not perform heavy builds inline.
 - The worker is the only component responsible for extraction and package generation.
 - If the mounted volume is empty or source files are missing, the API cannot resolve requests.
-- If a cached package already exists and is still valid, the job can resolve quickly without rebuilding artifacts.
+- If a cached package already exists and is still valid, the package can resolve quickly without rebuilding artifacts.
+- `minZoom` changes the package identity. The same bbox with different `minZoom` values generates different packages.
+- The public integration contract is package-based, not filesystem-based.
 
 ## Test Suite
 
@@ -201,4 +267,4 @@ Run:
 ./.venv/bin/python -m unittest discover -s tests -v
 ```
 
-The test suite covers source resolution, cache behavior, graph generation, job submission/status flow, streaming behavior, and source sync logic.
+The test suite covers source resolution, cache behavior, package submission/status flow, package artifact downloads, graph generation, streaming behavior, `minZoom` handling, and source sync logic.
