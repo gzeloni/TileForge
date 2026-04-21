@@ -4,76 +4,121 @@
 
 # Homelander
 
-Homelander is a regional map packaging API for offline/mobile applications.
+Homelander is a map packaging service for offline and mobile applications. Given a geographic bounding box and a `minZoom`, it resolves the best matching OpenStreetMap source extract, cuts a regional `.osm.pbf`, generates a vector tile package (`.mbtiles`), builds a road graph (`graph.json`), and caches the result for reuse.
 
-It receives a bounding box (`west`, `south`, `east`, `north`) plus `minZoom`, selects the correct South/Central America `.osm.pbf` source, extracts the requested region, generates a vector tile package (`.mbtiles`), builds a road graph (`graph.json`), and caches the result on disk.
+The service is built for repeated regional requests where the same or nearby areas may be requested multiple times over a short period. Instead of forcing clients to manage heavy GIS tooling, long-running jobs, or filesystem artifacts, Homelander exposes a package-oriented HTTP API with stable identifiers, status polling, artifact downloads, and progress streaming.
 
-The system is designed for repeated regional requests where the same area may be requested multiple times within a short time window.
+## Overview
 
-## What It Solves
+Homelander solves a practical packaging problem:
 
-This service exists to avoid building map artifacts manually for every requested area.
+- transform raw `.osm.pbf` source extracts into application-ready regional artifacts
+- keep the API responsive by offloading heavy processing to background workers
+- avoid rebuilding the same area unnecessarily through cache reuse and TTL-based expiration
+- provide a stable contract for clients that need package status, progress, and downloadable outputs
 
-It solves four operational problems:
-
-- It turns raw Geofabrik `.osm.pbf` extracts into application-ready regional packages.
-- It avoids reprocessing the same area over and over by caching builds for a limited TTL.
-- It keeps the web API responsive by pushing heavy generation work to a queue worker.
-- It exposes stable package status, artifact download endpoints, and streaming progress so clients do not wait blindly for long builds.
-
-## Output
-
-Each successful job produces a regional package containing:
+Each successful package contains:
 
 - `region.osm.pbf`
 - `map.mbtiles`
 - `graph.json`
 - `meta.json`
 
-These files are stored under the mounted maps volume, grouped by source and cache key.
+## Runtime Architecture
 
-## Architecture
+The default deployment is composed of three services:
 
-The service is split into three runtime components:
+- `homelander`: FastAPI application exposing the HTTP API
+- `homelander-worker`: RQ worker responsible for extraction and package generation
+- `redis`: queue backend plus job/progress state store
 
-- `homelander`: FastAPI web API
-- `homelander-worker`: RQ worker that performs heavy map builds
-- `redis`: queue backend and job/progress state store
+Core tooling used by the pipeline:
 
-Main tooling:
+- `osmium-tool` for source inspection and regional extraction
+- Python `osmium` bindings for graph generation
+- `tilemaker` for MBTiles generation
+- `RQ` and `Redis` for background execution and streaming state
 
-- `osmium` for source inspection and regional extraction
-- `tilemaker` for `.mbtiles` generation
-- Python `osmium` bindings for graph extraction
-- `RQ + Redis` for job execution and progress/state tracking
+High-level request flow:
 
-## High-Level Flow
+1. A client submits a bounding box and `minZoom` to `POST /api/map/packages`.
+2. The API validates the request and resolves the smallest source extract that fully covers the area.
+3. The API computes a package identity and either reuses an active build, returns a cached package, or enqueues a new build.
+4. The worker extracts the regional `.osm.pbf`, builds `graph.json`, and generates `map.mbtiles`.
+5. Artifacts are persisted under the mounted maps volume and exposed through package endpoints.
 
-1. Client submits a bounding box and `minZoom` to `POST /api/map/packages`.
-2. API validates the request and resolves the matching source extract.
-3. API enqueues or reuses a package build and returns `202 Accepted` with a stable `package_id`.
-4. Worker extracts the region with `osmium extract`.
-5. Worker builds `graph.json` from the regional `.osm.pbf`.
-6. Worker generates `map.mbtiles` with `tilemaker --bbox ...` and a generated config whose `settings.minzoom` matches the request.
-7. Package is written to cache and exposed through package status and artifact endpoints.
+## Repository Layout
 
-## Source Management
+```text
+.
+├── app/
+│   ├── app.py
+│   ├── api.py
+│   ├── helpers/
+│   ├── routes/
+│   └── services/
+├── tests/
+├── Dockerfile
+├── docker-compose.yaml
+├── docker-entrypoint.sh
+└── requirements.txt
+```
 
-Source files are expected in the mounted maps volume, for example:
+Main code areas:
+
+- `app/routes/`: HTTP endpoints and request/response orchestration
+- `app/services/maps.py`: source resolution, cache management, and package build pipeline
+- `app/services/jobs.py`: queue-backed job orchestration and package/job state
+- `app/services/sync.py`: source synchronization and manifest refresh logic
+- `tests/`: unit and integration-style coverage for package flow, cache behavior, graph generation, and source sync
+
+## Storage Model
+
+Homelander expects a writable maps root mounted into the containers. By default that root is `/osm_maps`.
+
+Typical layout:
 
 ```text
 /osm_maps/
-  south-america-latest.osm.pbf
-  central-america-latest.osm.pbf
+├── cache/
+│   └── <source_id>/
+│       └── <cache_key>__<normalized_bbox_slug>/
+│           ├── region.osm.pbf
+│           ├── map.mbtiles
+│           ├── graph.json
+│           └── meta.json
+└── sources/
+    └── manifest.json
 ```
 
-The service uses `/osm_maps/sources/manifest.json` as the source registry.
+Source files may live anywhere under `/osm_maps` as long as they are referenced by the manifest or discoverable during bootstrap.
 
-If the manifest does not exist, the container bootstraps it automatically by scanning local `.osm.pbf` files and extracting their coverage bounds. The generated manifest is persisted in the mounted volume so subsequent boots do not repeat that expensive discovery step.
+If `/osm_maps/sources/manifest.json` does not exist, the container entrypoint bootstraps it by scanning local `.osm.pbf` files, inspecting their bounds with `osmium`, and persisting the result. This avoids repeating source discovery on every boot.
 
-## Cache Model
+## Source Resolution And Synchronization
 
-Cache entries are keyed by:
+The source manifest is the registry Homelander uses to resolve incoming requests. Each source definition includes:
+
+- `source_id`
+- `path`
+- geographic bounds
+- optional priority
+- optional signature override
+- optional `download_url`
+
+When multiple sources cover the same area, Homelander selects the smallest matching footprint. This allows a more specific regional extract to win over a broader continental one.
+
+If source synchronization is enabled, the API process also runs a background scheduler that:
+
+- checks remote source fingerprints via HTTP `HEAD`
+- downloads updated extracts when the remote state changes
+- refreshes source signatures in the manifest after a successful download
+
+This keeps source data current without requiring a separate sync service.
+
+## Cache Semantics
+
+Package identity is based on:
 
 - normalized bounding box
 - requested `minZoom`
@@ -81,23 +126,38 @@ Cache entries are keyed by:
 - source signature
 - pipeline version
 
-Each package is stored under the source namespace and expires after the configured TTL.
+The cache has two important behaviors:
 
-This keeps repeated requests cheap while allowing the cache to be discarded aggressively.
+- `CACHE_BBOX_GRID` snaps nearby coordinates to a grid so very similar requests can collapse into the same package identity
+- `CACHE_BBOX_OFFSET` allows a ready package to be reused when its stored bounds safely cover a nearby request
 
-## API
+Cached packages expire after the configured TTL. Once expired, they are no longer considered ready and may be rebuilt on demand.
 
-All endpoints require:
+`minZoom` is part of the package identity. Two requests for the same bounds but different `minZoom` values produce different packages.
+
+## API Contract
+
+All routes require a bearer token:
 
 ```http
 Authorization: Bearer <API_KEY>
 ```
 
-### Create or reuse a package
+Request payload validation:
+
+- `west` and `east` must be between `-180` and `180`
+- `south` and `north` must be between `-90` and `90`
+- `west < east`
+- `south < north`
+- `minZoom` must be between `0` and `22`
+
+### Package Endpoints
 
 `POST /api/map/packages`
 
-Request body:
+Creates or reuses a package build and returns `202 Accepted`.
+
+Example request:
 
 ```json
 {
@@ -109,14 +169,14 @@ Request body:
 }
 ```
 
-Response:
+Example response:
 
 ```json
 {
   "package_id": "9f3c2a8e",
   "status": "queued",
   "source_id": "south-america-latest",
-  "job_id": "b5d3...",
+  "job_id": "b5d3c7d0-...",
   "expires_at": null,
   "artifacts": {
     "region_pbf": "/api/map/packages/9f3c2a8e/artifacts/region_pbf",
@@ -127,83 +187,141 @@ Response:
 }
 ```
 
-`package_id` is the stable identifier clients should keep.
-
-### Poll package status
-
 `GET /api/map/packages/{package_id}`
 
-Returns:
+Returns the current package state. Possible statuses:
 
 - `queued`
 - `building`
 - `ready`
 - `failed`
 
-plus artifact URLs when the package is ready.
+`GET /api/map/packages/{package_id}/artifacts/{artifact_name}`
 
-### Download artifacts
+Supported artifacts:
 
-- `GET /api/map/packages/{package_id}/artifacts/mbtiles`
-- `GET /api/map/packages/{package_id}/artifacts/graph`
-- `GET /api/map/packages/{package_id}/artifacts/meta`
-- `GET /api/map/packages/{package_id}/artifacts/region_pbf`
-
-These are the public download URLs. Clients should not attempt to access internal server paths such as `/osm_maps/cache/...`.
-
-### Stream progress for a new job
-
-`POST /api/map/stream`
-
-Returns newline-delimited JSON (`application/x-ndjson`). This remains available for submit-and-stream flows.
-
-### Stream progress for an existing package
+- `region_pbf`
+- `mbtiles`
+- `graph`
+- `meta`
 
 `GET /api/map/packages/{package_id}/stream`
 
-This endpoint is useful when the client first submits a package request, then attaches to progress later.
+Streams package progress as NDJSON (`application/x-ndjson`).
 
-### Legacy compatibility
+### Legacy Job Endpoints
 
-The older job-based endpoints still exist for compatibility:
+The older job-based contract is still available for compatibility:
 
 - `POST /api/map`
 - `GET /api/map/jobs/{job_id}`
 - `GET /api/map/jobs/{job_id}/stream`
 - `GET /api/map/jobs/{job_id}/artifacts/{artifact_name}`
+- `GET /api/map/jobs/{job_id}/artifact/{artifact_name}`
 
-They should not be the primary integration target for new clients.
+New integrations should prefer the package-based endpoints.
 
-## Progress Model
+### Progress Events
 
-Progress events are stored in Redis and streamed as NDJSON.
-
-Typical event types:
+Progress is emitted as NDJSON. Typical event types are:
 
 - `job`
 - `progress`
 - `result`
 - `error`
 
-`progress` events may include live subprocess output from `osmium` or `tilemaker`.
+`progress` events may include subprocess output from `osmium` or `tilemaker`, which is useful for long-running build visibility.
 
-## Local Development
+### Error Behavior
 
-Build and run:
+Common response classes:
+
+- `401` for missing or invalid API keys
+- `404` for unknown packages, jobs, or artifacts
+- `409` when an artifact is requested before the package is ready
+- `422` for invalid map bounds or `minZoom`
+- `500` when required local source data is missing
+- `503` when the build backend cannot accept work
+
+## Reverse Proxy Note
+
+The FastAPI app is configured with `root_path=/homelander` for proxy-aware deployments. In local Docker Compose usage, requests are sent directly to `/api/map/...` on port `3502`. If Homelander is mounted behind a reverse proxy path prefix, generated URLs and upstream routing may use `/homelander/api/map/...`.
+
+## Configuration
+
+The container runtime expects a `.env` file. The most relevant settings are:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `API_KEY` | none | Required bearer token for every API request |
+| `MAPS_ROOT` | `/osm_maps` | Root directory for sources, cache, and generated artifacts |
+| `SOURCES_MANIFEST` | `${MAPS_ROOT}/sources/manifest.json` | Source registry path |
+| `REDIS_URL` | `redis://redis:6379/0` | Redis connection used by the API and worker |
+| `RQ_QUEUE_NAME` | `homelander-maps` | Queue consumed by the worker |
+| `JOB_TTL_SECONDS` | `43200` | Retention for job snapshots and progress events |
+| `CACHE_TTL_HOURS` | `12` | Package cache TTL |
+| `CACHE_BBOX_OFFSET` | `0.02` | Reuse tolerance for nearby ready packages |
+| `CACHE_BBOX_GRID` | `0.02` | Bounding-box snapping grid used for package identity |
+| `PIPELINE_VERSION` | `v1` | Version token that invalidates old cache entries when changed |
+| `BUILD_SCRATCH_ROOT` | system temp dir | Temporary build directory root |
+| `PIPELINE_PARALLEL_TASKS` | `2` | Internal build parallelism |
+| `OSMIUM_BINARY` | `osmium` | Path to the `osmium` executable |
+| `TILEMAKER_BINARY` | `tilemaker` | Path to the `tilemaker` executable |
+| `TILEMAKER_CONFIG` | `/opt/tilemaker/config.json` | Base Tilemaker config used when `MBTILES_COMMAND` is not set |
+| `TILEMAKER_PROCESS` | `/opt/tilemaker/process.lua` | Tilemaker process Lua file |
+| `TILEMAKER_STORE` | `/tmp/tilemaker-store` | Tilemaker intermediate store path |
+| `TILEMAKER_THREADS` | auto | Tilemaker worker thread count |
+| `MBTILES_COMMAND` | unset | Full custom command template for MBTiles generation |
+| `ENABLE_SOURCE_SYNC` | `1` | Enable background source synchronization |
+| `SOURCE_SYNC_INTERVAL_HOURS` | `24` | Source sync interval |
+| `SOURCE_SYNC_ON_STARTUP` | `1` | Run source sync on process startup |
+| `SOURCE_SYNC_TIMEOUT_SECONDS` | `120` | HTTP timeout for remote source checks and downloads |
+| `SOURCE_DOWNLOAD_BASE_URL` | `https://download.geofabrik.de` | Base URL used when default download URLs are inferred |
+
+Example `.env`:
+
+```env
+API_KEY=change-me
+REDIS_URL=redis://redis:6379/0
+RQ_QUEUE_NAME=homelander-maps
+MAPS_ROOT=/osm_maps
+CACHE_TTL_HOURS=12
+ENABLE_SOURCE_SYNC=1
+SOURCE_SYNC_INTERVAL_HOURS=24
+```
+
+## Running With Docker Compose
+
+The repository includes a production-style `docker-compose.yaml` with:
+
+- `homelander` exposed on `3502`
+- `homelander-worker` consuming the same image
+- `redis` kept internal to the Compose network
+- a shared maps volume mounted at `/osm_maps`
+
+Build and start the stack:
 
 ```bash
 docker compose build --no-cache
 docker compose up -d redis homelander homelander-worker
 ```
 
-Check logs:
+Inspect logs:
 
 ```bash
 docker compose logs -f homelander
 docker compose logs -f homelander-worker
 ```
 
-Submit a job:
+Stop the stack:
+
+```bash
+docker compose down
+```
+
+## Local Usage Examples
+
+Create or reuse a package:
 
 ```bash
 curl -X POST http://localhost:3502/api/map/packages \
@@ -225,7 +343,7 @@ curl -H 'Authorization: Bearer YOUR_API_KEY' \
   http://localhost:3502/api/map/packages/PACKAGE_ID
 ```
 
-Download MBTiles:
+Download the MBTiles artifact:
 
 ```bash
 curl -L \
@@ -234,7 +352,7 @@ curl -L \
   -o map.mbtiles
 ```
 
-Stream progress:
+Stream package progress from submission time:
 
 ```bash
 curl -N -X POST http://localhost:3502/api/map/stream \
@@ -249,22 +367,44 @@ curl -N -X POST http://localhost:3502/api/map/stream \
   }'
 ```
 
-## Operational Notes
+Attach to progress later:
 
-- Redis is internal to Docker Compose and is not exposed on the host by default.
-- The API process does not perform heavy builds inline.
-- The worker is the only component responsible for extraction and package generation.
-- If the mounted volume is empty or source files are missing, the API cannot resolve requests.
-- If a cached package already exists and is still valid, the package can resolve quickly without rebuilding artifacts.
-- `minZoom` changes the package identity. The same bbox with different `minZoom` values generates different packages.
-- The public integration contract is package-based, not filesystem-based.
+```bash
+curl -N \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  http://localhost:3502/api/map/packages/PACKAGE_ID/stream
+```
 
-## Test Suite
+## Development Notes
 
-Run:
+Important operational characteristics:
+
+- heavy processing is performed only by the worker, not inline in the API process
+- if the maps volume is empty or missing source files, requests cannot be resolved
+- package downloads must go through the API rather than direct filesystem access
+- Redis state is ephemeral unless your Redis deployment is configured for persistence
+- cache reuse is intentional and may return previously built packages while they remain valid
+
+The Docker image:
+
+- builds `tilemaker` from source during the image build
+- installs `osmium-tool` in the runtime image
+- prepares `/osm_maps`, `/osm_maps/cache`, and `/osm_maps/sources` at container startup
+
+## Testing
+
+Run the test suite with:
 
 ```bash
 ./.venv/bin/python -m unittest discover -s tests -v
 ```
 
-The test suite covers source resolution, cache behavior, package submission/status flow, package artifact downloads, graph generation, streaming behavior, `minZoom` handling, and source sync logic.
+Current coverage includes:
+
+- source resolution and manifest bootstrap
+- cache behavior and package reuse
+- package submission, status polling, and artifact downloads
+- graph generation from regional extracts
+- streaming behavior
+- `minZoom` handling
+- source synchronization logic
