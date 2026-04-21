@@ -1,3 +1,5 @@
+"""Job orchestration for map builds."""
+
 import json
 import os
 import threading
@@ -6,11 +8,13 @@ import uuid
 from dataclasses import dataclass
 
 from app.helpers.model import MapArea, MapJobAcceptedResponse, MapJobStatusResponse
-from app.services.maps import MapService, build_default_service
+from app.services.maps import MapService, map_service
 
 
 @dataclass
 class JobSnapshot:
+    """Persisted job status."""
+
     job_id: str
     status: str
     cache_key: str
@@ -29,7 +33,7 @@ class JobSnapshot:
         )
 
 
-def _package_status_from_job_status(status: str) -> str:
+def _package_status(status: str) -> str:
     return {
         "queued": "queued",
         "running": "building",
@@ -38,22 +42,21 @@ def _package_status_from_job_status(status: str) -> str:
     }.get(status, status)
 
 
-def _result_value(result, field: str):
-    if result is None:
-        return None
-    if hasattr(result, field):
-        return getattr(result, field)
-    return result.get(field)
-
-
 def _package_payload_from_job(job: MapJobStatusResponse) -> dict:
+    expires_at = None
+    if job.result is not None:
+        expires_at = (
+            getattr(job.result, "expires_at", None)
+            if hasattr(job.result, "expires_at")
+            else job.result.get("expires_at")
+        )
     return {
         "package_id": job.cache_key,
-        "status": _package_status_from_job_status(job.status),
+        "status": _package_status(job.status),
         "source_id": job.source_id,
         "job_id": job.job_id,
         "error": job.error,
-        "expires_at": _result_value(job.result, "expires_at"),
+        "expires_at": expires_at,
     }
 
 
@@ -80,6 +83,8 @@ def _package_payload_from_meta(
 
 
 class PackageAwareJobServiceMixin:
+    """Add package endpoints on top of a job service."""
+
     def submit_package(self, area: MapArea) -> dict:
         job = self.submit_job(area)
         return self.get_package(job.cache_key)
@@ -129,6 +134,8 @@ class PackageAwareJobServiceMixin:
 
 class InMemoryJobStateStore:
     def __init__(self) -> None:
+        """Create an in-memory state store."""
+
         self.snapshots: dict[str, JobSnapshot] = {}
         self.events: dict[str, list[dict]] = {}
         self.active_by_cache_key: dict[str, str] = {}
@@ -216,6 +223,8 @@ class InMemoryJobStateStore:
 
 class InlineMapJobService(PackageAwareJobServiceMixin):
     def __init__(self, map_service: MapService) -> None:
+        """Create an inline job service."""
+
         self.map_service = map_service
         self.state_store = InMemoryJobStateStore()
 
@@ -278,6 +287,8 @@ class InlineMapJobService(PackageAwareJobServiceMixin):
 
 class RedisJobStateStore:
     def __init__(self, redis_url: str, ttl_seconds: int = 43200, namespace: str = "homelander") -> None:
+        """Create a Redis-backed state store."""
+
         from redis import Redis
 
         self.redis = Redis.from_url(redis_url, decode_responses=True)
@@ -395,6 +406,8 @@ class RedisJobStateStore:
 
 class RQMapJobService(PackageAwareJobServiceMixin):
     def __init__(self, map_service: MapService, queue, state_store) -> None:
+        """Create an RQ-backed job service."""
+
         self.map_service = map_service
         self.queue = queue
         self.state_store = state_store
@@ -439,7 +452,7 @@ class RQMapJobService(PackageAwareJobServiceMixin):
         snapshot = self.state_store.create_job(job_id, cache_key, source.source_id)
         try:
             self.queue.enqueue(
-                "app.services.jobs.run_map_job",
+                "app.services.jobs.run_job",
                 job_id,
                 area.model_dump(mode="json"),
                 cache_key,
@@ -469,14 +482,16 @@ class RQMapJobService(PackageAwareJobServiceMixin):
         yield from self.stream_job(job.job_id)
 
 
-def run_map_job(job_id: str, area_payload: dict, cache_key: str, source_id: str) -> dict:
+def run_job(job_id: str, area_payload: dict, cache_key: str, source_id: str) -> dict:
+    """Execute a queued map job."""
+
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
     state_store = RedisJobStateStore(
         redis_url=redis_url,
         ttl_seconds=int(os.getenv("JOB_TTL_SECONDS", "43200")),
     )
     area = MapArea(**area_payload)
-    map_service = build_default_service()
+    maps = map_service()
     state_store.set_status(job_id, "running")
 
     def reporter(step: str, message: str) -> None:
@@ -486,8 +501,8 @@ def run_map_job(job_id: str, area_payload: dict, cache_key: str, source_id: str)
         )
 
     try:
-        source, effective_area, prepared_cache_key, package_dir = map_service.prepare(area)
-        result = map_service.build_prepared(
+        source, effective_area, prepared_cache_key, package_dir = maps.prepare(area)
+        result = maps.build_prepared(
             source=source,
             area=effective_area,
             cache_key=prepared_cache_key,
@@ -504,7 +519,9 @@ def run_map_job(job_id: str, area_payload: dict, cache_key: str, source_id: str)
         state_store.clear_active(cache_key, job_id)
 
 
-def build_default_job_service():
+def job_service():
+    """Build the default job service from environment settings."""
+
     from rq import Queue
 
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
@@ -514,7 +531,7 @@ def build_default_job_service():
     state_store = RedisJobStateStore(redis_url=redis_url, ttl_seconds=ttl_seconds)
     queue = Queue(name=queue_name, connection=state_store.redis, default_timeout="1h")
     return RQMapJobService(
-        map_service=build_default_service(),
+        map_service=map_service(),
         queue=queue,
         state_store=state_store,
     )

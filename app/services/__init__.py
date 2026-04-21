@@ -1,5 +1,7 @@
+"""Public service exports."""
+
 from app.services.graph import GraphBuilder
-from app.services.jobs import InlineMapJobService, RQMapJobService, build_default_job_service
+from app.services.jobs import InlineMapJobService, RQMapJobService, job_service
 from app.services.maps import (
     CacheStore,
     CommandMbtilesBuilder,
@@ -7,8 +9,15 @@ from app.services.maps import (
     MapService,
     OsmiumRegionExtractor,
     SourceRegistry,
+    map_service,
 )
-from app.services.sync import HttpSourceFetcher, SourceSyncer
+from app.services.sync import (
+    HttpSourceFetcher,
+    ManifestSourceSync,
+    ScheduledSourceSync,
+    SourceSyncer,
+    source_sync,
+)
 
 __all__ = [
     "CacheStore",
@@ -18,9 +27,13 @@ __all__ = [
     "HttpSourceFetcher",
     "InlineMapJobService",
     "MapService",
+    "ManifestSourceSync",
     "OsmiumRegionExtractor",
     "RQMapJobService",
+    "ScheduledSourceSync",
     "SourceRegistry",
     "SourceSyncer",
-    "build_default_job_service",
+    "job_service",
+    "map_service",
+    "source_sync",
 ]

@@ -9,17 +9,18 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app.api import create_app
+from app.app import make_app
 from app.helpers.model import MapArea
 from app.services.jobs import InlineMapJobService
 from app.services.maps import (
+    ArtifactStageStore,
     CacheStore,
     CommandMbtilesBuilder,
     CompositeRegionPackageBuilder,
     MapService,
     SourceRegistry,
     SourceDefinition,
-    build_default_service,
+    map_service,
     ensure_sources_manifest,
 )
 
@@ -263,7 +264,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
             payload = {
                 "west": -46.70,
                 "south": -23.62,
@@ -329,7 +330,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
 
             submitted = client.post(
                 "/api/map/packages",
@@ -395,7 +396,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
 
             submitted = client.post(
                 "/api/map/packages",
@@ -460,7 +461,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
 
             first = client.post(
                 "/api/map/packages",
@@ -541,7 +542,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
             payload = {
                 "west": -49.5,
                 "south": -25.7,
@@ -606,7 +607,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
             payload = {
                 "west": -49.5,
                 "south": -25.7,
@@ -665,7 +666,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
 
             response = client.post(
                 "/api/map",
@@ -715,7 +716,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
 
             first = client.post(
                 "/api/map",
@@ -799,7 +800,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
 
             first = client.post(
                 "/api/map",
@@ -878,7 +879,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
 
             submitted = client.post(
                 "/api/map",
@@ -943,7 +944,7 @@ class MapApiTests(unittest.TestCase):
                 pipeline_version="test-v1",
             )
             service = InlineMapJobService(map_service=map_service)
-            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
 
             submitted = client.post(
                 "/api/map",
@@ -1026,6 +1027,55 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
             self.assertTrue((output_dir / "region.osm.pbf").exists())
             self.assertTrue((output_dir / "graph.json").exists())
             self.assertTrue((output_dir / "map.mbtiles").exists())
+
+    def test_reuses_extract_and_graph_for_different_min_zoom(self) -> None:
+        calls = {"extract": 0, "graph": 0, "mbtiles": 0}
+
+        class Extractor:
+            def extract(self, source_path: Path, area: MapArea, output_path: Path, reporter=None) -> None:
+                calls["extract"] += 1
+                output_path.write_bytes(b"pbf")
+
+        class GraphBuilder:
+            def build(self, input_path: Path, output_path: Path) -> None:
+                calls["graph"] += 1
+                output_path.write_text("{}", encoding="utf-8")
+
+        class MbtilesBuilder:
+            def build(self, input_path: Path, output_path: Path, area: MapArea, reporter=None) -> None:
+                calls["mbtiles"] += 1
+                output_path.write_bytes(f"mbtiles-{area.min_zoom}".encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_path = root / "south-america-latest.osm.pbf"
+            source_path.write_bytes(b"source")
+            artifact_store = ArtifactStageStore(root / "cache", pipeline_version="v1")
+            builder = CompositeRegionPackageBuilder(
+                extractor=Extractor(),
+                graph_builder=GraphBuilder(),
+                mbtiles_builder=MbtilesBuilder(),
+                artifact_store=artifact_store,
+                parallel_tasks=2,
+            )
+            source = type("Source", (), {"path": source_path, "source_id": "south-america-latest", "signature": lambda self: "sig"})()
+
+            first_output = root / "out-5"
+            second_output = root / "out-6"
+            builder.build(
+                source,
+                MapArea(west=0, south=0, east=1, north=1, minZoom=5),
+                first_output,
+            )
+            builder.build(
+                source,
+                MapArea(west=0, south=0, east=1, north=1, minZoom=6),
+                second_output,
+            )
+
+            self.assertEqual(calls, {"extract": 1, "graph": 1, "mbtiles": 2})
+            self.assertTrue((first_output / "region.osm.pbf").exists())
+            self.assertTrue((second_output / "graph.json").exists())
 
 
 class CommandMbtilesBuilderTests(unittest.TestCase):
@@ -1114,7 +1164,7 @@ class BuildDefaultServiceTests(unittest.TestCase):
                 "SOURCES_MANIFEST": str(manifest_path),
             }
             with patch.dict(os.environ, env, clear=False):
-                service = build_default_service()
+                service = map_service()
 
             self.assertEqual(
                 service.package_builder.mbtiles_builder.command_template,
@@ -1129,13 +1179,14 @@ class BuildDefaultServiceTests(unittest.TestCase):
                     "--store",
                     "/tmp/tilemaker-store",
                     "--threads",
-                    "4",
+                    str(max(1, min(6, os.cpu_count() or 1))),
                     "--config",
                     "{config}",
                     "--process",
                     "/opt/tilemaker/process.lua",
                 ],
             )
+            self.assertEqual(service.package_builder.parallel_tasks, 2)
 
     def test_discovers_sources_from_maps_root_when_manifest_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1166,7 +1217,7 @@ class BuildDefaultServiceTests(unittest.TestCase):
                 "SOURCES_MANIFEST": str(root / "missing-manifest.json"),
             }
             with patch.dict(os.environ, env, clear=False):
-                service = build_default_service()
+                service = map_service()
 
             source = service.source_registry.resolve(
                 MapArea(west=-49.26, south=-25.42, east=-49.21, north=-25.41)
@@ -1207,7 +1258,7 @@ class BuildDefaultServiceTests(unittest.TestCase):
             }
             with patch.dict(os.environ, env, clear=False):
                 with patch("app.services.maps.OsmiumSourceInspector.inspect") as inspect:
-                    service = build_default_service()
+                    service = map_service()
 
             inspect.assert_not_called()
             source = service.source_registry.resolve(
@@ -1245,6 +1296,68 @@ class BuildDefaultServiceTests(unittest.TestCase):
             self.assertTrue(manifest_path.exists())
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["sources"][0]["source_id"], "south-america-latest")
+
+    def test_prepare_refreshes_source_registry_when_manifest_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_source_path = root / "south-america-latest.osm.pbf"
+            second_source_path = root / "central-america-latest.osm.pbf"
+            first_source_path.write_bytes(b"source-1")
+            second_source_path.write_bytes(b"source-2")
+            manifest_path = root / "sources" / "manifest.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america-latest",
+                                "path": str(first_source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            env = {
+                "MAPS_ROOT": str(root),
+                "SOURCES_MANIFEST": str(manifest_path),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                service = map_service()
+
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "central-america-latest",
+                                "path": str(second_source_path),
+                                "bounds": {
+                                    "west": -118.0,
+                                    "south": 5.0,
+                                    "east": -74.0,
+                                    "north": 33.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            source, _, _, _ = service.prepare(
+                MapArea(west=-90.0, south=10.0, east=-80.0, north=20.0)
+            )
+
+            self.assertEqual(source.source_id, "central-america-latest")
 
 
 if __name__ == "__main__":

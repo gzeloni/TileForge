@@ -6,19 +6,22 @@ import osmium
 
 
 class GraphBuilder:
+    def __init__(self, location_index: str = "flex_mem") -> None:
+        self.location_index = location_index
+
     def build(self, input_path: Path, output_path: Path) -> None:
         collector = _GraphCollector()
-        collector.apply_file(str(input_path), locations=True)
-        output_path.write_text(
-            json.dumps(
+        collector.apply_file(str(input_path), locations=True, idx=self.location_index)
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(
                 {
                     "road_types": collector.road_type_list(),
                     "nodes": collector.nodes,
                     "edges": collector.edges,
-                }
-            ),
-            encoding="utf-8",
-        )
+                },
+                handle,
+                separators=(",", ":"),
+            )
 
 
 class _GraphCollector(osmium.SimpleHandler):
@@ -34,6 +37,8 @@ class _GraphCollector(osmium.SimpleHandler):
         if not highway:
             return
 
+        node_indexes = self.node_indexes
+        append_node = self._append_node
         points: list[tuple[int, float, float]] = []
         for node in way.nodes:
             if not node.location.valid():
@@ -53,8 +58,8 @@ class _GraphCollector(osmium.SimpleHandler):
         road_type_id = self.road_types.setdefault(highway, len(self.road_types))
 
         for ref, lat, lon in points:
-            if ref not in self.node_indexes:
-                self.node_indexes[ref] = self._append_node(lat, lon)
+            if ref not in node_indexes:
+                node_indexes[ref] = append_node(lat, lon)
 
         for current, following in zip(points, points[1:]):
             dist = _haversine(current[1], current[2], following[1], following[2])
@@ -62,8 +67,8 @@ class _GraphCollector(osmium.SimpleHandler):
                 continue
             self.edges.append(
                 [
-                    self.node_indexes[current[0]],
-                    self.node_indexes[following[0]],
+                    node_indexes[current[0]],
+                    node_indexes[following[0]],
                     round(dist, 1),
                     road_type_id,
                     oneway,
