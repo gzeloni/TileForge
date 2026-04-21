@@ -29,11 +29,110 @@ class JobSnapshot:
         )
 
 
+def _package_status_from_job_status(status: str) -> str:
+    return {
+        "queued": "queued",
+        "running": "building",
+        "succeeded": "ready",
+        "failed": "failed",
+    }.get(status, status)
+
+
+def _result_value(result, field: str):
+    if result is None:
+        return None
+    if hasattr(result, field):
+        return getattr(result, field)
+    return result.get(field)
+
+
+def _package_payload_from_job(job: MapJobStatusResponse) -> dict:
+    return {
+        "package_id": job.cache_key,
+        "status": _package_status_from_job_status(job.status),
+        "source_id": job.source_id,
+        "job_id": job.job_id,
+        "error": job.error,
+        "expires_at": _result_value(job.result, "expires_at"),
+    }
+
+
+def _package_payload_from_meta(
+    package_id: str,
+    package_dir,
+    meta: dict,
+    job_id: str | None = None,
+) -> dict:
+    return {
+        "package_id": package_id,
+        "status": "ready",
+        "source_id": meta["source_id"],
+        "job_id": job_id,
+        "error": None,
+        "expires_at": meta["expires_at"],
+        "artifacts": {
+            "region_pbf": str(package_dir / "region.osm.pbf"),
+            "mbtiles": str(package_dir / "map.mbtiles"),
+            "graph": str(package_dir / "graph.json"),
+            "meta": str(package_dir / "meta.json"),
+        },
+    }
+
+
+class PackageAwareJobServiceMixin:
+    def submit_package(self, area: MapArea) -> dict:
+        job = self.submit_job(area)
+        return self.get_package(job.cache_key)
+
+    def get_package(self, package_id: str) -> dict:
+        package_dir = self.map_service.cache_store.find_package_by_cache_key(package_id)
+        latest_job_id = self.state_store.get_latest_job_id(package_id)
+        if package_dir is not None:
+            meta = self.map_service.cache_store.read_meta(package_dir)
+            return _package_payload_from_meta(package_id, package_dir, meta, latest_job_id)
+
+        if latest_job_id is None:
+            raise KeyError(package_id)
+
+        return _package_payload_from_job(self.get_job(latest_job_id))
+
+    def stream_package(self, package_id: str):
+        latest_job_id = self.state_store.get_latest_job_id(package_id)
+        if latest_job_id is not None:
+            yield from self.stream_job(latest_job_id)
+            return
+
+        package_dir = self.map_service.cache_store.find_package_by_cache_key(package_id)
+        if package_dir is None:
+            raise KeyError(package_id)
+
+        meta = self.map_service.cache_store.read_meta(package_dir)
+        yield {"event": "result", "data": _package_payload_from_meta(package_id, package_dir, meta)}
+
+    def get_package_artifact_path(self, package_id: str, artifact_name: str):
+        package_dir = self.map_service.cache_store.find_package_by_cache_key(package_id)
+        if package_dir is None:
+            latest_job_id = self.state_store.get_latest_job_id(package_id)
+            if latest_job_id is not None:
+                raise RuntimeError("package is not ready")
+            raise KeyError(package_id)
+
+        meta = self.map_service.cache_store.read_meta(package_dir)
+        artifact = meta.get("artifacts", {}).get(artifact_name)
+        if artifact is None:
+            raise KeyError(f"artifact:{artifact_name}")
+        path = package_dir / artifact
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return path
+
+
 class InMemoryJobStateStore:
     def __init__(self) -> None:
         self.snapshots: dict[str, JobSnapshot] = {}
         self.events: dict[str, list[dict]] = {}
         self.active_by_cache_key: dict[str, str] = {}
+        self.latest_by_cache_key: dict[str, str] = {}
         self.lock = threading.Lock()
 
     def create_job(self, job_id: str, cache_key: str, source_id: str) -> JobSnapshot:
@@ -55,6 +154,7 @@ class InMemoryJobStateStore:
                 }
             ]
             self.active_by_cache_key[cache_key] = job_id
+            self.latest_by_cache_key[cache_key] = job_id
         return snapshot
 
     def get_job(self, job_id: str) -> MapJobStatusResponse:
@@ -67,6 +167,10 @@ class InMemoryJobStateStore:
     def get_active_job_id(self, cache_key: str) -> str | None:
         with self.lock:
             return self.active_by_cache_key.get(cache_key)
+
+    def get_latest_job_id(self, cache_key: str) -> str | None:
+        with self.lock:
+            return self.latest_by_cache_key.get(cache_key)
 
     def set_status(self, job_id: str, status: str) -> None:
         with self.lock:
@@ -110,7 +214,7 @@ class InMemoryJobStateStore:
             time.sleep(0.01)
 
 
-class InlineMapJobService:
+class InlineMapJobService(PackageAwareJobServiceMixin):
     def __init__(self, map_service: MapService) -> None:
         self.map_service = map_service
         self.state_store = InMemoryJobStateStore()
@@ -203,6 +307,7 @@ class RedisJobStateStore:
         )
         pipeline.expire(self._events_key(job_id), self.ttl_seconds)
         pipeline.set(self._active_key(cache_key), job_id, ex=self.ttl_seconds)
+        pipeline.set(self._latest_key(cache_key), job_id, ex=self.ttl_seconds)
         pipeline.execute()
         return snapshot
 
@@ -215,6 +320,9 @@ class RedisJobStateStore:
 
     def get_active_job_id(self, cache_key: str) -> str | None:
         return self.redis.get(self._active_key(cache_key))
+
+    def get_latest_job_id(self, cache_key: str) -> str | None:
+        return self.redis.get(self._latest_key(cache_key))
 
     def set_status(self, job_id: str, status: str) -> None:
         snapshot = self._snapshot(job_id)
@@ -281,8 +389,11 @@ class RedisJobStateStore:
     def _active_key(self, cache_key: str) -> str:
         return f"{self.namespace}:cache:{cache_key}:active"
 
+    def _latest_key(self, cache_key: str) -> str:
+        return f"{self.namespace}:cache:{cache_key}:latest"
 
-class RQMapJobService:
+
+class RQMapJobService(PackageAwareJobServiceMixin):
     def __init__(self, map_service: MapService, queue, state_store) -> None:
         self.map_service = map_service
         self.queue = queue

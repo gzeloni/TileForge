@@ -14,6 +14,7 @@ from app.helpers.model import MapArea
 from app.services.jobs import InlineMapJobService
 from app.services.maps import (
     CacheStore,
+    CommandMbtilesBuilder,
     CompositeRegionPackageBuilder,
     MapService,
     SourceRegistry,
@@ -225,6 +226,284 @@ class CacheStoreTests(unittest.TestCase):
 
 class MapApiTests(unittest.TestCase):
     API_KEY = "test-api-key"
+
+    def test_post_packages_returns_package_id_and_ready_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+            payload = {
+                "west": -46.70,
+                "south": -23.62,
+                "east": -46.56,
+                "north": -23.50,
+            }
+
+            submitted = client.post(
+                "/api/map/packages",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+
+            self.assertEqual(submitted.status_code, 202)
+            self.assertIn("package_id", submitted.json())
+            self.assertIn(submitted.json()["status"], {"queued", "building", "ready"})
+            self.assertEqual(submitted.json()["source_id"], "south-america")
+            self.assertEqual(
+                submitted.json()["artifacts"]["mbtiles"],
+                f"/api/map/packages/{submitted.json()['package_id']}/artifacts/mbtiles",
+            )
+            for _ in range(10):
+                status = client.get(
+                    f"/api/map/packages/{submitted.json()['package_id']}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if status.json()["status"] == "ready":
+                    break
+
+    def test_get_package_status_returns_ready_without_job_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+
+            submitted = client.post(
+                "/api/map/packages",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.50,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            package_id = submitted.json()["package_id"]
+            package_status = None
+            for _ in range(10):
+                package_status = client.get(
+                    f"/api/map/packages/{package_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if package_status.json()["status"] == "ready":
+                    break
+
+            self.assertEqual(package_status.status_code, 200)
+            self.assertEqual(package_status.json()["status"], "ready")
+            self.assertEqual(package_status.json()["package_id"], package_id)
+            self.assertEqual(
+                package_status.json()["artifacts"]["graph"],
+                f"/api/map/packages/{package_id}/artifacts/graph",
+            )
+
+    def test_downloads_mbtiles_artifact_from_package_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+
+            submitted = client.post(
+                "/api/map/packages",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.50,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            package_id = submitted.json()["package_id"]
+            for _ in range(10):
+                status = client.get(
+                    f"/api/map/packages/{package_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if status.json()["status"] == "ready":
+                    break
+
+            artifact = client.get(
+                f"/api/map/packages/{package_id}/artifacts/mbtiles",
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+
+            self.assertEqual(artifact.status_code, 200)
+            self.assertEqual(artifact.content, b"mbtiles")
+
+    def test_different_min_zoom_creates_different_package(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+
+            first = client.post(
+                "/api/map/packages",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.50,
+                    "minZoom": 5,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            first_package_id = first.json()["package_id"]
+            for _ in range(10):
+                first_status = client.get(
+                    f"/api/map/packages/{first_package_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if first_status.json()["status"] == "ready":
+                    break
+
+            second = client.post(
+                "/api/map/packages",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.50,
+                    "minZoom": 6,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            second_package_id = second.json()["package_id"]
+            for _ in range(10):
+                second_status = client.get(
+                    f"/api/map/packages/{second_package_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if second_status.json()["status"] == "ready":
+                    break
+
+            self.assertEqual(builder.calls, 2)
+            self.assertNotEqual(first_package_id, second_package_id)
 
     def test_post_submits_background_job_and_exposes_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -563,6 +842,136 @@ class MapApiTests(unittest.TestCase):
             self.assertEqual(builder.calls, 1)
             self.assertTrue(second_status.json()["result"]["cached"])
 
+    def test_downloads_mbtiles_artifact_from_completed_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+
+            submitted = client.post(
+                "/api/map",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.50,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            job_id = submitted.json()["job_id"]
+            for _ in range(10):
+                status = client.get(
+                    f"/api/map/jobs/{job_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if status.json()["status"] == "succeeded":
+                    break
+
+            artifact = client.get(
+                f"/api/map/jobs/{job_id}/artifacts/mbtiles",
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+
+            self.assertEqual(artifact.status_code, 200)
+            self.assertEqual(artifact.content, b"mbtiles")
+
+    def test_downloads_mbtiles_artifact_from_singular_artifact_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(create_app(service=service, api_key=self.API_KEY))
+
+            submitted = client.post(
+                "/api/map",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.50,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            job_id = submitted.json()["job_id"]
+            for _ in range(10):
+                status = client.get(
+                    f"/api/map/jobs/{job_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if status.json()["status"] == "succeeded":
+                    break
+
+            artifact = client.get(
+                f"/api/map/jobs/{job_id}/artifact/mbtiles",
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+
+            self.assertEqual(artifact.status_code, 200)
+            self.assertEqual(artifact.content, b"mbtiles")
+
 
 class CompositeRegionPackageBuilderTests(unittest.TestCase):
     def test_runs_all_build_steps(self) -> None:
@@ -619,6 +1028,60 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
             self.assertTrue((output_dir / "map.mbtiles").exists())
 
 
+class CommandMbtilesBuilderTests(unittest.TestCase):
+    def test_renders_tilemaker_config_with_requested_min_zoom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "region.osm.pbf"
+            input_path.write_bytes(b"pbf")
+            output_path = root / "map.mbtiles"
+            base_config_path = root / "config.json"
+            base_config_path.write_text(
+                json.dumps(
+                    {
+                        "layers": {"roads": {"minzoom": 12, "maxzoom": 14}},
+                        "settings": {"minzoom": 0, "maxzoom": 14, "basezoom": 14},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            builder = CommandMbtilesBuilder(
+                command_template=[
+                    "tilemaker",
+                    "--input",
+                    "{input}",
+                    "--output",
+                    "{output}",
+                    "--bbox",
+                    "{west},{south},{east},{north}",
+                    "--config",
+                    "{config}",
+                    "--process",
+                    "/opt/tilemaker/process.lua",
+                ],
+                base_config_path=base_config_path,
+            )
+
+            captured = {}
+
+            def fake_run(command, reporter=None, step=None):
+                captured["command"] = command
+
+            with patch("app.services.maps._run_command", side_effect=fake_run):
+                builder.build(
+                    input_path=input_path,
+                    output_path=output_path,
+                    area=MapArea(west=-46.7, south=-23.62, east=-46.56, north=-23.50, minZoom=5),
+                )
+
+            generated_config = Path(captured["command"][8])
+            payload = json.loads(generated_config.read_text(encoding="utf-8"))
+            self.assertEqual(payload["settings"]["minzoom"], 5)
+            self.assertEqual(payload["settings"]["maxzoom"], 14)
+            self.assertEqual(payload["settings"]["basezoom"], 14)
+
+
 class BuildDefaultServiceTests(unittest.TestCase):
     def test_defaults_mbtiles_builder_to_tilemaker_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -668,7 +1131,7 @@ class BuildDefaultServiceTests(unittest.TestCase):
                     "--threads",
                     "4",
                     "--config",
-                    "/opt/tilemaker/config.json",
+                    "{config}",
                     "--process",
                     "/opt/tilemaker/process.lua",
                 ],

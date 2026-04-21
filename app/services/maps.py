@@ -148,6 +148,7 @@ class CacheStore:
             json.dumps(
                 {
                     "bbox": bbox,
+                    "min_zoom": area.min_zoom,
                     "pipeline_version": pipeline_version,
                     "source_id": source.source_id,
                     "source_signature": source.signature(),
@@ -156,7 +157,7 @@ class CacheStore:
             ).encode("utf-8")
         ).hexdigest()[:8]
         slug = (
-            f"w{bbox['west']}_s{bbox['south']}_e{bbox['east']}_n{bbox['north']}"
+            f"z{area.min_zoom}_w{bbox['west']}_s{bbox['south']}_e{bbox['east']}_n{bbox['north']}"
             .replace(".", "_")
         )
         return digest, self.root / source.source_id / f"{digest}__{slug}"
@@ -201,6 +202,8 @@ class CacheStore:
             bbox = meta.get("bbox")
             if not bbox:
                 continue
+            if meta.get("min_zoom", 0) != area.min_zoom:
+                continue
             if not _bbox_contains_with_offset(bbox, area, self.bbox_offset):
                 continue
 
@@ -209,6 +212,15 @@ class CacheStore:
                 best_match = (area_size, package_dir)
 
         return best_match[1] if best_match else None
+
+    def find_package_by_cache_key(self, cache_key: str) -> Path | None:
+        if not self.root.exists():
+            return None
+
+        for package_dir in self.root.glob(f"*/{cache_key}__*"):
+            if self.is_ready(package_dir):
+                return package_dir
+        return None
 
     def is_ready(self, package_dir: Path) -> bool:
         meta_path = package_dir / "meta.json"
@@ -299,12 +311,18 @@ class OsmiumSourceInspector:
 
 
 class CommandMbtilesBuilder:
-    def __init__(self, command_template: list[str] | None) -> None:
+    def __init__(
+        self,
+        command_template: list[str] | None,
+        base_config_path: Path | None = None,
+    ) -> None:
         self.command_template = command_template
+        self.base_config_path = base_config_path
 
     def build(self, input_path: Path, output_path: Path, area: MapArea, reporter=None) -> None:
         if not self.command_template:
             raise RuntimeError("MBTiles build command is not configured")
+        config_path = self._render_config(output_path.parent, area) if self.base_config_path else None
         command = [
             part.format(
                 input=input_path,
@@ -313,10 +331,23 @@ class CommandMbtilesBuilder:
                 south=area.south,
                 east=area.east,
                 north=area.north,
+                min_zoom=area.min_zoom,
+                config=config_path if config_path is not None else "",
             )
             for part in self.command_template
         ]
         _run_command(command, reporter=reporter, step="mbtiles")
+
+    def _render_config(self, output_dir: Path, area: MapArea) -> Path:
+        assert self.base_config_path is not None
+        payload = json.loads(self.base_config_path.read_text(encoding="utf-8"))
+        settings = payload.setdefault("settings", {})
+        settings["minzoom"] = area.min_zoom
+        settings["maxzoom"] = max(int(settings.get("maxzoom", area.min_zoom)), area.min_zoom)
+        settings["basezoom"] = max(int(settings.get("basezoom", settings["maxzoom"])), area.min_zoom)
+        config_path = output_dir / "tilemaker-config.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        return config_path
 
 
 class CompositeRegionPackageBuilder:
@@ -380,7 +411,7 @@ class MapService:
             reusable_bbox = reusable_meta["bbox"]
             return (
                 source,
-                MapArea(**reusable_bbox),
+                MapArea(min_zoom=reusable_meta.get("min_zoom", 0), **reusable_bbox),
                 reusable_meta["cache_key"],
                 reusable_package_dir,
             )
@@ -441,6 +472,7 @@ class MapService:
             "pipeline_version": self.pipeline_version,
             "source_id": source.source_id,
             "source_signature": source.signature(),
+            "min_zoom": area.min_zoom,
             "bbox": {
                 "west": area.west,
                 "south": area.south,
@@ -501,7 +533,7 @@ def build_default_service() -> MapService:
         "--threads",
         tilemaker_threads,
         "--config",
-        os.getenv("TILEMAKER_CONFIG", "/opt/tilemaker/config.json"),
+        "{config}",
         "--process",
         os.getenv("TILEMAKER_PROCESS", "/opt/tilemaker/process.lua"),
     ]
@@ -523,7 +555,12 @@ def build_default_service() -> MapService:
             extractor=OsmiumRegionExtractor(binary=os.getenv("OSMIUM_BINARY", "osmium")),
             graph_builder=GraphBuilder(),
             mbtiles_builder=CommandMbtilesBuilder(
-                shlex.split(mbtiles_command) if mbtiles_command else tilemaker_command
+                shlex.split(mbtiles_command) if mbtiles_command else tilemaker_command,
+                base_config_path=(
+                    None
+                    if mbtiles_command
+                    else Path(os.getenv("TILEMAKER_CONFIG", "/opt/tilemaker/config.json"))
+                ),
             ),
         ),
         pipeline_version=pipeline_version,
