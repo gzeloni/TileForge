@@ -4,9 +4,9 @@
 
 # Homelander
 
-Homelander is a map packaging service for offline and mobile applications. Given a geographic bounding box and a `minZoom`, it resolves the best matching OpenStreetMap source extract, cuts a regional `.osm.pbf`, generates a vector tile package (`.mbtiles`), builds a road graph (`graph.json`), and caches the result for reuse.
+Homelander is a map packaging service for offline and mobile applications. Given a geographic bounding box and a `minZoom`, it resolves the best matching OpenStreetMap source extract, cuts a regional `.osm.pbf`, generates a vector tile package (`.mbtiles`), builds a road graph (`graph.json`), and caches identical requests for reuse.
 
-The service is built for repeated regional requests where the same or nearby areas may be requested multiple times over a short period. Instead of forcing clients to manage heavy GIS tooling, long-running jobs, or filesystem artifacts, Homelander exposes a package-oriented HTTP API with stable identifiers, status polling, artifact downloads, and progress streaming.
+The service is built for repeated regional requests where the same area may be requested multiple times over a short period. Instead of forcing clients to manage heavy GIS tooling, long-running jobs, or filesystem artifacts, Homelander exposes a package-oriented HTTP API with stable identifiers, status polling, artifact downloads, and progress streaming.
 
 ## Overview
 
@@ -14,7 +14,7 @@ Homelander solves a practical packaging problem:
 
 - transform raw `.osm.pbf` source extracts into application-ready regional artifacts
 - keep the API responsive by offloading heavy processing to background workers
-- avoid rebuilding the same area unnecessarily through cache reuse and TTL-based expiration
+- avoid rebuilding identical requests unnecessarily through cache reuse and TTL-based expiration
 - provide a stable contract for clients that need package status, progress, and downloadable outputs
 
 Each successful package contains:
@@ -35,7 +35,7 @@ The default deployment is composed of three services:
 Core tooling used by the pipeline:
 
 - `osmium-tool` for source inspection and regional extraction
-- Python `osmium` bindings for graph generation
+- subprocess calls to `osmium-tool` for graph extraction and clipping
 - `tilemaker` for MBTiles generation
 - `RQ` and `Redis` for background execution and streaming state
 
@@ -120,20 +120,15 @@ This keeps source data current without requiring a separate sync service.
 
 Package identity is based on:
 
-- normalized bounding box
+- exact bounding box
 - requested `minZoom`
 - source id
 - source signature
 - pipeline version
 
-The cache has two important behaviors:
-
-- `CACHE_BBOX_GRID` snaps nearby coordinates to a grid so very similar requests can collapse into the same package identity
-- `CACHE_BBOX_OFFSET` allows a ready package to be reused when its stored bounds safely cover a nearby request
-
 Cached packages expire after the configured TTL. Once expired, they are no longer considered ready and may be rebuilt on demand.
 
-`minZoom` is part of the package identity. Two requests for the same bounds but different `minZoom` values produce different packages.
+`minZoom` is part of the package identity. Two requests for the same bounds but different `minZoom` values produce different packages. Any request with different bounds produces a new package.
 
 ## API Contract
 
@@ -260,8 +255,6 @@ The container runtime expects a `.env` file. The most relevant settings are:
 | `RQ_QUEUE_NAME` | `homelander-maps` | Queue consumed by the worker |
 | `JOB_TTL_SECONDS` | `43200` | Retention for job snapshots and progress events |
 | `CACHE_TTL_HOURS` | `12` | Package cache TTL |
-| `CACHE_BBOX_OFFSET` | `0.02` | Reuse tolerance for nearby ready packages |
-| `CACHE_BBOX_GRID` | `0.02` | Bounding-box snapping grid used for package identity |
 | `PIPELINE_VERSION` | `v1` | Version token that invalidates old cache entries when changed |
 | `BUILD_SCRATCH_ROOT` | system temp dir | Temporary build directory root |
 | `PIPELINE_PARALLEL_TASKS` | `2` | Internal build parallelism |
@@ -383,7 +376,7 @@ Important operational characteristics:
 - if the maps volume is empty or missing source files, requests cannot be resolved
 - package downloads must go through the API rather than direct filesystem access
 - Redis state is ephemeral unless your Redis deployment is configured for persistence
-- cache reuse is intentional and may return previously built packages while they remain valid
+- cache reuse is intentional, but only for identical requests while they remain valid
 
 The Docker image:
 
@@ -404,7 +397,7 @@ Current coverage includes:
 - source resolution and manifest bootstrap
 - cache behavior and package reuse
 - package submission, status polling, and artifact downloads
-- graph generation from regional extracts
+- graph generation from regional extracts with manual bbox cropping
 - streaming behavior
 - `minZoom` handling
 - source synchronization logic

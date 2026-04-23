@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.helpers.model import MapArea
 from app.services.graph import GraphBuilder
 
 
@@ -30,7 +31,7 @@ OSM_XML = """<?xml version='1.0' encoding='UTF-8'?>
 
 
 class GraphBuilderTests(unittest.TestCase):
-    def test_builds_graph_from_region_pbf_without_simplifying_whole_way(self) -> None:
+    def test_builds_graph_from_region_pbf_using_manual_bbox_crop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             osm_path = root / "input.osm"
@@ -42,7 +43,11 @@ class GraphBuilderTests(unittest.TestCase):
                 check=True,
             )
 
-            GraphBuilder().build(pbf_path, graph_path)
+            GraphBuilder().build(
+                pbf_path,
+                graph_path,
+                MapArea(west=-49.2715, south=-25.4321, east=-49.2685, north=-25.4305),
+            )
             graph = json.loads(graph_path.read_text(encoding="utf-8"))
 
             self.assertEqual(graph["road_types"], ["residential", "service"])

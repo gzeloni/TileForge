@@ -150,55 +150,10 @@ class CacheStoreTests(unittest.TestCase):
             self.assertEqual(removed, 1)
             self.assertFalse(package_dir.exists())
 
-    def test_reuses_containing_cached_package_within_offset(self) -> None:
+    def test_different_bbox_creates_different_package_coordinates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            store = CacheStore(
-                root / "cache",
-                ttl=timedelta(hours=12),
-                bbox_offset=0.02,
-            )
-            package_dir = root / "cache" / "south-america" / "abc"
-            package_dir.mkdir(parents=True)
-            (package_dir / "region.osm.pbf").write_bytes(b"pbf")
-            (package_dir / "map.mbtiles").write_bytes(b"mbtiles")
-            (package_dir / "graph.json").write_text("{}", encoding="utf-8")
-            (package_dir / "meta.json").write_text(
-                json.dumps(
-                    {
-                        "created_at": datetime.now(UTC).isoformat(),
-                        "expires_at": (datetime.now(UTC) + timedelta(hours=12)).isoformat(),
-                        "bbox": {
-                            "west": -46.70,
-                            "south": -23.62,
-                            "east": -46.56,
-                            "north": -23.50,
-                        },
-                        "artifacts": {
-                            "region_pbf": "region.osm.pbf",
-                            "mbtiles": "map.mbtiles",
-                            "graph": "graph.json",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            reusable = store.find_reusable_package(
-                source_id="south-america",
-                area=MapArea(west=-46.70, south=-23.62, east=-46.56, north=-23.51),
-            )
-
-            self.assertEqual(reusable, package_dir)
-
-    def test_snaps_nearby_bboxes_to_same_package_coordinates(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = CacheStore(
-                root / "cache",
-                ttl=timedelta(hours=12),
-                bbox_grid=0.02,
-            )
+            store = CacheStore(root / "cache", ttl=timedelta(hours=12))
             source_path = root / "south-america.osm.pbf"
             source_path.write_bytes(b"source")
             source = SourceDefinition(
@@ -221,8 +176,8 @@ class CacheStoreTests(unittest.TestCase):
                 pipeline_version="v1",
             )
 
-            self.assertEqual(first_key, second_key)
-            self.assertEqual(first_dir, second_dir)
+            self.assertNotEqual(first_key, second_key)
+            self.assertNotEqual(first_dir, second_dir)
 
 
 class MapApiTests(unittest.TestCase):
@@ -680,7 +635,7 @@ class MapApiTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 401)
 
-    def test_reuses_larger_cached_bbox_for_nearby_request(self) -> None:
+    def test_nearby_request_builds_new_package(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest_path = root / "sources.json"
@@ -707,7 +662,7 @@ class MapApiTests(unittest.TestCase):
             )
 
             registry = SourceRegistry.from_file(manifest_path)
-            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12), bbox_offset=0.02)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
             builder = FakeRegionPackageBuilder()
             map_service = MapService(
                 source_registry=registry,
@@ -756,10 +711,10 @@ class MapApiTests(unittest.TestCase):
                 if second_status.json()["status"] == "succeeded":
                     break
 
-            self.assertEqual(builder.calls, 1)
-            self.assertTrue(second_status.json()["result"]["cached"])
+            self.assertEqual(builder.calls, 2)
+            self.assertFalse(second_status.json()["result"]["cached"])
 
-    def test_reuses_same_snapped_grid_without_reprocessing(self) -> None:
+    def test_identical_request_reuses_cached_package(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest_path = root / "sources.json"
@@ -786,12 +741,7 @@ class MapApiTests(unittest.TestCase):
             )
 
             registry = SourceRegistry.from_file(manifest_path)
-            cache_store = CacheStore(
-                root / "cache",
-                ttl=timedelta(hours=12),
-                bbox_offset=0.0,
-                bbox_grid=0.02,
-            )
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
             builder = FakeRegionPackageBuilder()
             map_service = MapService(
                 source_registry=registry,
@@ -827,7 +777,7 @@ class MapApiTests(unittest.TestCase):
                     "west": -46.70,
                     "south": -23.62,
                     "east": -46.56,
-                    "north": -23.51,
+                    "north": -23.50,
                 },
                 headers={"Authorization": f"Bearer {self.API_KEY}"},
             )
@@ -990,7 +940,7 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
                 output_path.write_bytes(b"pbf")
 
         class GraphBuilder:
-            def build(self, input_path: Path, output_path: Path) -> None:
+            def build(self, input_path: Path, output_path: Path, area: MapArea) -> None:
                 calls.append("graph")
                 output_path.write_text("{}", encoding="utf-8")
 
@@ -1037,7 +987,7 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
                 output_path.write_bytes(b"pbf")
 
         class GraphBuilder:
-            def build(self, input_path: Path, output_path: Path) -> None:
+            def build(self, input_path: Path, output_path: Path, area: MapArea) -> None:
                 calls["graph"] += 1
                 output_path.write_text("{}", encoding="utf-8")
 
