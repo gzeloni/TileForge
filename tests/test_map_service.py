@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app.app import make_app
+from app.api import make_app
 from app.helpers.model import MapArea
 from app.services.jobs import InlineMapJobService
 from app.services.maps import (
