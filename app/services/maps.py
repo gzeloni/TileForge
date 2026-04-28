@@ -648,7 +648,7 @@ def map_service() -> MapService:
     manifest_path = Path(
         os.getenv("SOURCES_MANIFEST", str(maps_root / "sources" / "manifest.json"))
     )
-    ttl_hours = int(os.getenv("CACHE_TTL_HOURS", "12"))
+    ttl_hours = int(os.getenv("CACHE_TTL_HOURS", "1"))
     pipeline_version = os.getenv("PIPELINE_VERSION", "v1")
     scratch_root = Path(
         os.getenv(
