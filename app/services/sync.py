@@ -4,13 +4,13 @@ import json
 import os
 import threading
 import time
-import fcntl
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
 import httpx
 
+from app.services.derived import manifest_lock
 from app.services.maps import (
     OsmiumSourceInspector,
     SourceDefinition,
@@ -131,14 +131,8 @@ class ManifestSourceSync:
 
     @contextmanager
     def _lock(self):
-        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = self.manifest_path.with_name(f"{self.manifest_path.name}.sync.lock")
-        with lock_path.open("a+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with manifest_lock(self.manifest_path):
+            yield
 
 
 class ScheduledSourceSync:

@@ -1,5 +1,6 @@
 """Map packaging services."""
 
+import math
 import fcntl
 import hashlib
 import json
@@ -31,6 +32,11 @@ class SourceDefinition:
     priority: int = 100
     signature_override: str | None = None
     download_url: str | None = None
+    kind: str = "base"
+    region_id: str | None = None
+    parent_source_id: str | None = None
+    parent_source_signature: str | None = None
+    pinned: bool = False
 
     def contains(self, area: MapArea) -> bool:
         return (
@@ -75,6 +81,11 @@ class SourceRegistry:
                     or _default_download_url(
                         item["source_id"] if "source_id" in item else item["id"]
                     ),
+                    kind=item.get("kind", "base"),
+                    region_id=item.get("region_id"),
+                    parent_source_id=item.get("parent_source_id"),
+                    parent_source_signature=item.get("parent_source_signature"),
+                    pinned=bool(item.get("pinned", False)),
                 )
             )
         return cls(sources)
@@ -120,6 +131,19 @@ class SourceRegistry:
                     },
                     "signature": source.signature(),
                     **({"download_url": source.download_url} if source.download_url else {}),
+                    **({"kind": source.kind} if source.kind != "base" else {}),
+                    **({"region_id": source.region_id} if source.region_id else {}),
+                    **(
+                        {"parent_source_id": source.parent_source_id}
+                        if source.parent_source_id
+                        else {}
+                    ),
+                    **(
+                        {"parent_source_signature": source.parent_source_signature}
+                        if source.parent_source_signature
+                        else {}
+                    ),
+                    **({"pinned": True} if source.pinned else {}),
                 }
                 for source in self.sources
             ]
@@ -139,10 +163,12 @@ class CacheStore:
         root: Path,
         ttl: timedelta,
         scratch_root: Path | None = None,
+        snap_degrees: float = 0.0,
     ) -> None:
         self.root = root
         self.ttl = ttl
         self.scratch_root = scratch_root or root
+        self.snap_degrees = max(0.0, snap_degrees)
 
     def package_coordinates(
         self,
@@ -337,8 +363,9 @@ class ArtifactStageStore:
 
 
 class OsmiumRegionExtractor:
-    def __init__(self, binary: str = "osmium") -> None:
+    def __init__(self, binary: str = "osmium", strategy: str = "smart") -> None:
         self.binary = binary
+        self.strategy = strategy
 
     def extract(self, source_path: Path, area: MapArea, output_path: Path, reporter=None) -> None:
         _run_command(
@@ -347,7 +374,7 @@ class OsmiumRegionExtractor:
                 "extract",
                 "--overwrite",
                 "--strategy",
-                "smart",
+                self.strategy,
                 "--set-bounds",
                 "--bbox",
                 f"{area.west},{area.south},{area.east},{area.north}",
@@ -501,6 +528,7 @@ class MapService:
         pipeline_version: str,
         source_registry_loader=None,
         source_registry_state_getter=None,
+        usage_tracker=None,
     ) -> None:
         self.source_registry = source_registry
         self.cache_store = cache_store
@@ -508,6 +536,7 @@ class MapService:
         self.pipeline_version = pipeline_version
         self.source_registry_loader = source_registry_loader
         self.source_registry_state_getter = source_registry_state_getter
+        self.usage_tracker = usage_tracker
         self._source_registry_state = (
             source_registry_state_getter() if source_registry_state_getter else None
         )
@@ -525,13 +554,19 @@ class MapService:
 
     def prepare(self, area: MapArea) -> tuple[SourceDefinition, MapArea, str, Path]:
         self._refresh_source_registry()
-        source = self.source_registry.resolve(area)
+        effective_area = _canonical_area(area, self.cache_store.snap_degrees)
+        source = self.source_registry.resolve(effective_area)
         cache_key, package_dir = self.cache_store.package_coordinates(
             source=source,
-            area=area,
+            area=effective_area,
             pipeline_version=self.pipeline_version,
         )
-        return source, area, cache_key, package_dir
+        return source, effective_area, cache_key, package_dir
+
+    def track_usage(self, area: MapArea, source: SourceDefinition) -> None:
+        if self.usage_tracker is None:
+            return
+        self.usage_tracker.record_request(area, source)
 
     def _refresh_source_registry(self) -> None:
         if not self.source_registry_loader or not self.source_registry_state_getter:
@@ -649,15 +684,18 @@ def map_service() -> MapService:
         os.getenv("SOURCES_MANIFEST", str(maps_root / "sources" / "manifest.json"))
     )
     ttl_hours = int(os.getenv("CACHE_TTL_HOURS", "1"))
-    pipeline_version = os.getenv("PIPELINE_VERSION", "v1")
+    snap_degrees = float(os.getenv("CACHE_KEY_SNAP_DEGREES", "0.001"))
+    pipeline_version = os.getenv("PIPELINE_VERSION", "v2-smart-extract")
     scratch_root = Path(
         os.getenv(
             "BUILD_SCRATCH_ROOT",
             str(Path(tempfile.gettempdir()) / "homelander-builds"),
         )
     )
+    osmium_location_index = os.getenv("OSMIUM_LOCATION_INDEX", "flex_mem")
+    osmium_extract_strategy = os.getenv("OSMIUM_EXTRACT_STRATEGY", "smart")
     tilemaker_threads = os.getenv("TILEMAKER_THREADS", str(max(1, min(6, os.cpu_count() or 1))))
-    parallel_tasks = int(os.getenv("PIPELINE_PARALLEL_TASKS", "2"))
+    parallel_tasks = int(os.getenv("PIPELINE_PARALLEL_TASKS", "1"))
     tilemaker_command = [
         os.getenv("TILEMAKER_BINARY", "tilemaker"),
         "--input",
@@ -687,10 +725,17 @@ def map_service() -> MapService:
             maps_root / "cache",
             ttl=timedelta(hours=ttl_hours),
             scratch_root=scratch_root,
+            snap_degrees=snap_degrees,
         ),
         package_builder=CompositeRegionPackageBuilder(
-            extractor=OsmiumRegionExtractor(binary=os.getenv("OSMIUM_BINARY", "osmium")),
-            graph_builder=GraphBuilder(binary=os.getenv("OSMIUM_BINARY", "osmium")),
+            extractor=OsmiumRegionExtractor(
+                binary=os.getenv("OSMIUM_BINARY", "osmium"),
+                strategy=osmium_extract_strategy,
+            ),
+            graph_builder=GraphBuilder(
+                binary=os.getenv("OSMIUM_BINARY", "osmium"),
+                location_index=osmium_location_index,
+            ),
             mbtiles_builder=CommandMbtilesBuilder(
                 shlex.split(mbtiles_command) if mbtiles_command else tilemaker_command,
                 base_config_path=(
@@ -719,6 +764,26 @@ def _normalized_bbox(area: MapArea) -> dict[str, str]:
         "east": f"{area.east:.6f}",
         "north": f"{area.north:.6f}",
     }
+
+
+def _canonical_area(area: MapArea, snap_degrees: float) -> MapArea:
+    if snap_degrees <= 0:
+        return area
+    return MapArea(
+        west=max(-180.0, _snap_down(area.west, snap_degrees)),
+        south=max(-90.0, _snap_down(area.south, snap_degrees)),
+        east=min(180.0, _snap_up(area.east, snap_degrees)),
+        north=min(90.0, _snap_up(area.north, snap_degrees)),
+        min_zoom=area.min_zoom,
+    )
+
+
+def _snap_down(value: float, step: float) -> float:
+    return round(math.floor(value / step) * step, 6)
+
+
+def _snap_up(value: float, step: float) -> float:
+    return round(math.ceil(value / step) * step, 6)
 
 
 def _source_id_from_path(path: Path) -> str:

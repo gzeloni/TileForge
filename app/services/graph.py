@@ -1,6 +1,8 @@
 import json
 import math
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -54,69 +56,81 @@ class GraphBuilder:
             )
 
     def _iter_cropped_ways(self, input_path: Path, area: MapArea):
-        command = [
-            self.binary,
-            "add-locations-to-ways",
-            "--no-progress",
-            "--ignore-missing-nodes",
-            "--index-type",
-            self.location_index,
-            "-f",
-            "opl,add_metadata=false",
-            str(input_path),
-        ]
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        assert process.stderr is not None
+        with self._location_index_arg() as location_index:
+            command = [
+                self.binary,
+                "add-locations-to-ways",
+                "--no-progress",
+                "--ignore-missing-nodes",
+                "--index-type",
+                location_index,
+                "-f",
+                "opl,add_metadata=false",
+                str(input_path),
+            ]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            assert process.stderr is not None
 
-        try:
-            for raw_line in process.stdout:
-                line = raw_line.strip()
-                if not line.startswith("w"):
-                    continue
-
-                fields = _parse_opl_fields(line)
-                tags = _parse_tags(fields.get("T", ""))
-                highway = tags.get("highway")
-                node_field = fields.get("N")
-                if not highway or not node_field:
-                    continue
-
-                points = _parse_way_points(node_field)
-                if len(points) < 2:
-                    continue
-
-                oneway_value = tags.get("oneway", "").lower()
-                if oneway_value == "-1":
-                    points.reverse()
-                    oneway = 1
-                else:
-                    oneway = 1 if oneway_value in {"yes", "1", "true"} else 0
-
-                for cropped_points in _crop_way_points(points, area):
-                    if len(cropped_points) < 2:
+            try:
+                for raw_line in process.stdout:
+                    line = raw_line.strip()
+                    if not line.startswith("w"):
                         continue
-                    yield {
-                        "highway": highway,
-                        "oneway": oneway,
-                        "points": cropped_points,
-                    }
-        finally:
-            stderr = process.stderr.read()
-            return_code = process.wait()
-            if return_code != 0:
-                raise subprocess.CalledProcessError(
-                    return_code,
-                    command,
-                    output=None,
-                    stderr=stderr,
-                )
+
+                    fields = _parse_opl_fields(line)
+                    tags = _parse_tags(fields.get("T", ""))
+                    highway = tags.get("highway")
+                    node_field = fields.get("N")
+                    if not highway or not node_field:
+                        continue
+
+                    points = _parse_way_points(node_field)
+                    if len(points) < 2:
+                        continue
+
+                    oneway_value = tags.get("oneway", "").lower()
+                    if oneway_value == "-1":
+                        points.reverse()
+                        oneway = 1
+                    else:
+                        oneway = 1 if oneway_value in {"yes", "1", "true"} else 0
+
+                    for cropped_points in _crop_way_points(points, area):
+                        if len(cropped_points) < 2:
+                            continue
+                        yield {
+                            "highway": highway,
+                            "oneway": oneway,
+                            "points": cropped_points,
+                        }
+            finally:
+                stderr = process.stderr.read()
+                return_code = process.wait()
+                process.stdout.close()
+                process.stderr.close()
+                if return_code != 0:
+                    raise subprocess.CalledProcessError(
+                        return_code,
+                        command,
+                        output=None,
+                        stderr=stderr,
+                    )
+
+    @contextmanager
+    def _location_index_arg(self):
+        if "," in self.location_index or not self.location_index.endswith("_file_array"):
+            yield self.location_index
+            return
+
+        with tempfile.TemporaryDirectory(prefix="osmium-index-") as tmp:
+            yield f"{self.location_index},{Path(tmp) / 'locations.idx'}"
 
 
 def _parse_opl_fields(line: str) -> dict[str, str]:

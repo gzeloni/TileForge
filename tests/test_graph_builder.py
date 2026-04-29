@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.helpers.model import MapArea
 from app.services.graph import GraphBuilder
@@ -54,6 +55,41 @@ class GraphBuilderTests(unittest.TestCase):
             self.assertEqual(len(graph["nodes"]), 4)
             self.assertEqual(len(graph["edges"]), 3)
             self.assertEqual(graph["edges"][0][4], 1)
+
+    def test_uses_temp_index_file_for_file_backed_osmium_indexes(self) -> None:
+        area = MapArea(west=-49.2715, south=-25.4321, east=-49.2685, north=-25.4305)
+        captured = {}
+
+        class FakeStream:
+            def __iter__(self):
+                return iter(())
+
+            def read(self) -> str:
+                return ""
+
+            def close(self) -> None:
+                return None
+
+        class FakeProcess:
+            def __init__(self, command):
+                captured["command"] = command
+                index_type, index_path = command[5].split(",", 1)
+                captured["index_type"] = index_type
+                captured["index_path_exists_during_run"] = Path(index_path).parent.exists()
+                self.stdout = FakeStream()
+                self.stderr = FakeStream()
+
+            def wait(self) -> int:
+                return 0
+
+        def fake_popen(command, **kwargs):
+            return FakeProcess(command)
+
+        with patch("app.services.graph.subprocess.Popen", side_effect=fake_popen):
+            list(GraphBuilder(location_index="sparse_file_array")._iter_cropped_ways(Path("/tmp/input.osm.pbf"), area))
+
+        self.assertEqual(captured["index_type"], "sparse_file_array")
+        self.assertTrue(captured["index_path_exists_during_run"])
 
 
 if __name__ == "__main__":

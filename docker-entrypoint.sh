@@ -4,6 +4,7 @@ set -eu
 MAPS_ROOT="${MAPS_ROOT:-/osm_maps}"
 CACHE_DIR="${MAPS_ROOT}/cache"
 SOURCES_DIR="${MAPS_ROOT}/sources"
+BOOTSTRAP_DEFAULTS="${DERIVED_BOOTSTRAP_DEFAULTS_ON_STARTUP:-1}"
 
 if [ "$(id -u)" = "0" ]; then
     install -d -m 0775 -o appuser -g appuser "${MAPS_ROOT}"
@@ -11,6 +12,9 @@ if [ "$(id -u)" = "0" ]; then
     install -d -m 0775 -o appuser -g appuser "${SOURCES_DIR}"
     if [ ! -f "${SOURCES_DIR}/manifest.json" ]; then
         gosu appuser python -c "from pathlib import Path; from app.services.maps import ensure_sources_manifest; ensure_sources_manifest(Path('${MAPS_ROOT}'), Path('${SOURCES_DIR}/manifest.json'))"
+    fi
+    if [ "${BOOTSTRAP_DEFAULTS}" = "1" ] && [ "${1:-}" != "rq" ]; then
+        gosu appuser python -c "from app.services.derived import ensure_default_derived_sources_safe; ensure_default_derived_sources_safe()"
     fi
     exec gosu appuser "$@"
 fi

@@ -3,6 +3,14 @@ services:
     image: redis:7-alpine
     container_name: homelander-redis
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1" # Max one CPU core
+          memory: 1G # Hard limit (OOM kill if exceeded)
+        reservations:
+          cpus: "0.50" # Guaranteed minimum CPU
+          memory: 256M # Guaranteed minimum RAM
 
   homelander:
     build:
@@ -16,8 +24,38 @@ services:
     depends_on:
       - redis
     env_file: .env
+    environment:
+      DERIVED_DEFAULT_REGIONS: >-
+        [{"region_id":"brazil","source_id":"brazil","parent_source_id":"south-america-latest","path":"derived/brazil.osm.pbf","query":"Brazil","country_codes":"br","priority":20,"pinned":true},{"region_id":"paraguay","source_id":"paraguay","parent_source_id":"south-america-latest","path":"derived/paraguay.osm.pbf","query":"Paraguay","country_codes":"py","priority":20,"pinned":true}]
+      DERIVED_ADAPTIVE_REGIONS: "[]"
+      DERIVED_INDEX_PATH: /osm_maps/cache/derived_sources.sqlite3
+      DERIVED_SOURCE_IDLE_TTL_HOURS: "720"
+      DERIVED_PRECACHE_IDLE_MINUTES: "15"
+      DERIVED_SYNC_INTERVAL_MINUTES: "15"
+      DERIVED_SYNC_ON_STARTUP: "1"
+      DERIVED_BOOTSTRAP_DEFAULTS_ON_STARTUP: "1"
+      CACHE_KEY_SNAP_DEGREES: "0.001"
+      PIPELINE_VERSION: v2-smart-extract
+      PIPELINE_PARALLEL_TASKS: "1"
+      TILEMAKER_THREADS: "1"
+      TILEMAKER_STORE: /osm_maps/cache/tilemaker-store
+      OSMIUM_EXTRACT_STRATEGY: "smart"
+      OSMIUM_LOCATION_INDEX: "sparse_file_array"
+      REGION_LOOKUP_URL: https://nominatim.openstreetmap.org/search
+      REGION_LOOKUP_USER_AGENT: homelander-region-resolver/1.0
+      REGION_LOOKUP_TIMEOUT_SECONDS: "15"
+      REGION_LOOKUP_CACHE_TTL_HOURS: "168"
+      RQ_PRECACHE_QUEUE_NAME: homelander-precache
     volumes:
       - /mnt/fshex/homelander_maps:/osm_maps
+    deploy:
+      resources:
+        limits:
+          cpus: "4" # Max 10 CPU cores
+          memory: 2G # Hard limit (OOM kill if exceeded)
+        reservations:
+          cpus: "1" # Guaranteed minimum CPU
+          memory: 1G # Guaranteed minimum RAM
 
   homelander-worker:
     image: homelander:latest
@@ -28,6 +66,89 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - RQ_QUEUE_NAME=homelander-maps
-    command: ["rq", "worker", "--url", "redis://redis:6379/0", "homelander-maps"]
+      - RQ_PRECACHE_QUEUE_NAME=homelander-precache
+      - DERIVED_DEFAULT_REGIONS=[{"region_id":"brazil","source_id":"brazil","parent_source_id":"south-america-latest","path":"derived/brazil.osm.pbf","query":"Brazil","country_codes":"br","priority":20,"pinned":true},{"region_id":"paraguay","source_id":"paraguay","parent_source_id":"south-america-latest","path":"derived/paraguay.osm.pbf","query":"Paraguay","country_codes":"py","priority":20,"pinned":true}]
+      - DERIVED_ADAPTIVE_REGIONS=[]
+      - DERIVED_INDEX_PATH=/osm_maps/cache/derived_sources.sqlite3
+      - DERIVED_SOURCE_IDLE_TTL_HOURS=720
+      - DERIVED_PRECACHE_IDLE_MINUTES=15
+      - DERIVED_SYNC_INTERVAL_MINUTES=15
+      - DERIVED_SYNC_ON_STARTUP=1
+      - DERIVED_BOOTSTRAP_DEFAULTS_ON_STARTUP=1
+      - CACHE_KEY_SNAP_DEGREES=0.001
+      - PIPELINE_VERSION=v2-smart-extract
+      - PIPELINE_PARALLEL_TASKS=1
+      - TILEMAKER_THREADS=1
+      - TILEMAKER_STORE=/osm_maps/cache/tilemaker-store
+      - OSMIUM_EXTRACT_STRATEGY=smart
+      - OSMIUM_LOCATION_INDEX=sparse_file_array
+      - REGION_LOOKUP_URL=https://nominatim.openstreetmap.org/search
+      - REGION_LOOKUP_USER_AGENT=homelander-region-resolver/1.0
+      - REGION_LOOKUP_TIMEOUT_SECONDS=15
+      - REGION_LOOKUP_CACHE_TTL_HOURS=168
+    command:
+      [
+        "rq",
+        "worker",
+        "--url",
+        "redis://redis:6379/0",
+        "homelander-maps",
+      ]
     volumes:
       - /mnt/fshex/homelander_maps:/osm_maps
+    deploy:
+      resources:
+        limits:
+          cpus: "10" # Max 10 CPU cores
+          memory: 8G # Hard limit (OOM kill if exceeded)
+        reservations:
+          cpus: "4" # Guaranteed minimum CPU
+          memory: 4G # Guaranteed minimum RAM
+
+  homelander-precache-worker:
+    image: homelander:latest
+    container_name: homelander-precache-worker
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - RQ_QUEUE_NAME=homelander-maps
+      - RQ_PRECACHE_QUEUE_NAME=homelander-precache
+      - DERIVED_DEFAULT_REGIONS=[{"region_id":"brazil","source_id":"brazil","parent_source_id":"south-america-latest","path":"derived/brazil.osm.pbf","query":"Brazil","country_codes":"br","priority":20,"pinned":true},{"region_id":"paraguay","source_id":"paraguay","parent_source_id":"south-america-latest","path":"derived/paraguay.osm.pbf","query":"Paraguay","country_codes":"py","priority":20,"pinned":true}]
+      - DERIVED_ADAPTIVE_REGIONS=[]
+      - DERIVED_INDEX_PATH=/osm_maps/cache/derived_sources.sqlite3
+      - DERIVED_SOURCE_IDLE_TTL_HOURS=720
+      - DERIVED_PRECACHE_IDLE_MINUTES=15
+      - DERIVED_SYNC_INTERVAL_MINUTES=15
+      - DERIVED_SYNC_ON_STARTUP=1
+      - DERIVED_BOOTSTRAP_DEFAULTS_ON_STARTUP=1
+      - CACHE_KEY_SNAP_DEGREES=0.001
+      - PIPELINE_VERSION=v2-smart-extract
+      - PIPELINE_PARALLEL_TASKS=1
+      - TILEMAKER_THREADS=1
+      - TILEMAKER_STORE=/osm_maps/cache/tilemaker-store
+      - OSMIUM_EXTRACT_STRATEGY=smart
+      - OSMIUM_LOCATION_INDEX=sparse_file_array
+      - REGION_LOOKUP_URL=https://nominatim.openstreetmap.org/search
+      - REGION_LOOKUP_USER_AGENT=homelander-region-resolver/1.0
+      - REGION_LOOKUP_TIMEOUT_SECONDS=15
+      - REGION_LOOKUP_CACHE_TTL_HOURS=168
+    command:
+      [
+        "rq",
+        "worker",
+        "--url",
+        "redis://redis:6379/0",
+        "homelander-precache",
+      ]
+    volumes:
+      - /mnt/fshex/homelander_maps:/osm_maps
+    deploy:
+      resources:
+        limits:
+          cpus: "1" # Keep precache from competing with the main queue
+          memory: 2G # Enough for osmium-derived extracts without starving map builds
+        reservations:
+          cpus: "0.25" # Minimal guaranteed CPU
+          memory: 512M # Minimal guaranteed RAM

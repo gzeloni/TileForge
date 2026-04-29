@@ -18,6 +18,7 @@ from app.services.maps import (
     CommandMbtilesBuilder,
     CompositeRegionPackageBuilder,
     MapService,
+    OsmiumRegionExtractor,
     SourceRegistry,
     SourceDefinition,
     map_service,
@@ -178,6 +179,98 @@ class CacheStoreTests(unittest.TestCase):
 
             self.assertNotEqual(first_key, second_key)
             self.assertNotEqual(first_dir, second_dir)
+
+    def test_close_bbox_can_share_package_coordinates_when_snap_is_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = CacheStore(
+                root / "cache",
+                ttl=timedelta(hours=12),
+                snap_degrees=0.001,
+            )
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"source")
+            source = SourceDefinition(
+                source_id="south-america",
+                path=source_path,
+                west=-92.0,
+                south=-57.0,
+                east=-27.0,
+                north=15.0,
+            )
+
+            first_area = MapArea(west=-46.7002, south=-23.6202, east=-46.5602, north=-23.5002)
+            second_area = MapArea(west=-46.7007, south=-23.6207, east=-46.5607, north=-23.5007)
+
+            first_key, first_dir = store.package_coordinates(
+                source=source,
+                area=first_area,
+                pipeline_version="v1",
+            )
+            second_key, second_dir = store.package_coordinates(
+                source=source,
+                area=second_area,
+                pipeline_version="v1",
+            )
+
+            self.assertNotEqual(first_key, second_key)
+            self.assertNotEqual(first_dir, second_dir)
+
+    def test_prepare_snaps_bbox_outward_for_cache_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            store = CacheStore(
+                root / "cache",
+                ttl=timedelta(hours=12),
+                snap_degrees=0.001,
+            )
+            service = MapService(
+                source_registry=registry,
+                cache_store=store,
+                package_builder=FakeRegionPackageBuilder(),
+                pipeline_version="test-v1",
+            )
+
+            _, first_area, first_key, _ = service.prepare(
+                MapArea(west=-46.7002, south=-23.6202, east=-46.5602, north=-23.5002)
+            )
+            _, second_area, second_key, _ = service.prepare(
+                MapArea(west=-46.7007, south=-23.6207, east=-46.5607, north=-23.5007)
+            )
+
+            self.assertEqual(first_area.west, -46.701)
+            self.assertEqual(first_area.south, -23.621)
+            self.assertEqual(first_area.east, -46.56)
+            self.assertEqual(first_area.north, -23.5)
+            self.assertEqual(second_area.west, -46.701)
+            self.assertEqual(second_area.south, -23.621)
+            self.assertEqual(second_area.east, -46.56)
+            self.assertEqual(second_area.north, -23.5)
+            self.assertEqual(first_key, second_key)
 
 
 class MapApiTests(unittest.TestCase):
@@ -1082,6 +1175,40 @@ class CommandMbtilesBuilderTests(unittest.TestCase):
             self.assertEqual(payload["settings"]["basezoom"], 14)
 
 
+class OsmiumRegionExtractorTests(unittest.TestCase):
+    def test_uses_smart_strategy_by_default(self) -> None:
+        captured = {}
+
+        def fake_run(command, reporter=None, step=None):
+            captured["command"] = command
+            captured["step"] = step
+
+        with patch("app.services.maps._run_command", side_effect=fake_run):
+            OsmiumRegionExtractor().extract(
+                Path("/tmp/source.osm.pbf"),
+                MapArea(west=-44.105, south=-20.045, east=-43.81, north=-19.712),
+                Path("/tmp/output.osm.pbf"),
+            )
+
+        self.assertEqual(
+            captured["command"],
+            [
+                "osmium",
+                "extract",
+                "--overwrite",
+                "--strategy",
+                "smart",
+                "--set-bounds",
+                "--bbox",
+                "-44.105,-20.045,-43.81,-19.712",
+                "-o",
+                "/tmp/output.osm.pbf",
+                "/tmp/source.osm.pbf",
+            ],
+        )
+        self.assertEqual(captured["step"], "extract")
+
+
 class BuildDefaultServiceTests(unittest.TestCase):
     def test_defaults_mbtiles_builder_to_tilemaker_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1136,7 +1263,86 @@ class BuildDefaultServiceTests(unittest.TestCase):
                     "/opt/tilemaker/process.lua",
                 ],
             )
-            self.assertEqual(service.package_builder.parallel_tasks, 2)
+            self.assertEqual(service.package_builder.extractor.strategy, "smart")
+            self.assertEqual(service.package_builder.graph_builder.location_index, "flex_mem")
+            self.assertEqual(service.package_builder.parallel_tasks, 1)
+
+    def test_reads_osmium_location_index_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "manifest.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"source")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            env = {
+                "MAPS_ROOT": str(root),
+                "SOURCES_MANIFEST": str(manifest_path),
+                "OSMIUM_LOCATION_INDEX": "sparse_file_array",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                service = map_service()
+
+            self.assertEqual(service.package_builder.graph_builder.location_index, "sparse_file_array")
+
+    def test_reads_osmium_extract_strategy_and_tilemaker_store_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "manifest.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"source")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            env = {
+                "MAPS_ROOT": str(root),
+                "SOURCES_MANIFEST": str(manifest_path),
+                "OSMIUM_EXTRACT_STRATEGY": "complete_ways",
+                "TILEMAKER_STORE": "/osm_maps/cache/tilemaker-store",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                service = map_service()
+
+            self.assertEqual(service.package_builder.extractor.strategy, "complete_ways")
+            self.assertEqual(
+                service.package_builder.mbtiles_builder.command_template[8],
+                "/osm_maps/cache/tilemaker-store",
+            )
 
     def test_discovers_sources_from_maps_root_when_manifest_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

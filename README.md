@@ -255,7 +255,7 @@ The container runtime expects a `.env` file. The most relevant settings are:
 | `RQ_QUEUE_NAME` | `homelander-maps` | Queue consumed by the worker |
 | `JOB_TTL_SECONDS` | `43200` | Retention for job snapshots and progress events |
 | `CACHE_TTL_HOURS` | `12` | Package cache TTL |
-| `PIPELINE_VERSION` | `v1` | Version token that invalidates old cache entries when changed |
+| `PIPELINE_VERSION` | `v2-smart-extract` | Version token that invalidates old cache entries when changed |
 | `BUILD_SCRATCH_ROOT` | system temp dir | Temporary build directory root |
 | `PIPELINE_PARALLEL_TASKS` | `2` | Internal build parallelism |
 | `OSMIUM_BINARY` | `osmium` | Path to the `osmium` executable |

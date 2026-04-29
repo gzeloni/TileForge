@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 
 from app.helpers.model import MapArea, MapJobAcceptedResponse, MapJobStatusResponse
+from app.services.derived import derived_source_manager
 from app.services.maps import MapService, map_service
 
 
@@ -230,6 +231,7 @@ class InlineMapJobService(PackageAwareJobServiceMixin):
 
     def submit_job(self, area: MapArea) -> MapJobAcceptedResponse:
         source, effective_area, cache_key, package_dir = self.map_service.prepare(area)
+        self.map_service.track_usage(area, source)
         active_job_id = self.state_store.get_active_job_id(cache_key)
         if active_job_id:
             existing = self.state_store.get_job(active_job_id)
@@ -414,6 +416,7 @@ class RQMapJobService(PackageAwareJobServiceMixin):
 
     def submit_job(self, area: MapArea) -> MapJobAcceptedResponse:
         source, effective_area, cache_key, package_dir = self.map_service.prepare(area)
+        self.map_service.track_usage(area, source)
 
         if self.map_service.cache_store.is_ready(package_dir):
             job_id = f"cache-{cache_key}"
@@ -492,6 +495,7 @@ def run_job(job_id: str, area_payload: dict, cache_key: str, source_id: str) -> 
     )
     area = MapArea(**area_payload)
     maps = map_service()
+    maps.usage_tracker = derived_source_manager()
     state_store.set_status(job_id, "running")
 
     def reporter(step: str, message: str) -> None:
@@ -530,8 +534,10 @@ def job_service():
 
     state_store = RedisJobStateStore(redis_url=redis_url, ttl_seconds=ttl_seconds)
     queue = Queue(name=queue_name, connection=state_store.redis, default_timeout="1h")
+    maps = map_service()
+    maps.usage_tracker = derived_source_manager()
     return RQMapJobService(
-        map_service=map_service(),
+        map_service=maps,
         queue=queue,
         state_store=state_store,
     )

@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.routes import router
+from app.services.derived import source_derivation_sync
 from app.services.jobs import job_service
 from app.services.sync import source_sync
 
@@ -19,18 +20,24 @@ def make_app(service=None, api_key: str | None = None) -> FastAPI:
         app.state.jobs = service or job_service()
         app.state.api_key = api_key
         app.state.sync = None if service is not None else source_sync()
+        app.state.derived_sync = None if service is not None else source_derivation_sync()
         if app.state.sync is not None:
             app.state.sync.start()
+        if app.state.derived_sync is not None:
+            app.state.derived_sync.start()
         try:
             yield
         finally:
             if app.state.sync is not None:
                 app.state.sync.stop()
+            if app.state.derived_sync is not None:
+                app.state.derived_sync.stop()
 
     app = FastAPI(root_path="/homelander", lifespan=lifespan)
     app.state.jobs = service
     app.state.api_key = api_key
     app.state.sync = None
+    app.state.derived_sync = None
     app.include_router(router)
     return app
 
