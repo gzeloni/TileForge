@@ -5,3 +5,4 @@ redis==6.4.0
 requests==2.33.1
 rq==2.6.0
 httpx==0.28.1
+geopy==2.4.1

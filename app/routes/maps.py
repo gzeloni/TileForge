@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse, StreamingResponse
 
+from geopy.geocoders import Nominatim
 from app.helpers.model import (
     ArtifactPaths,
     MapArea,
@@ -16,7 +17,9 @@ from app.helpers.model import (
 )
 from app.routes.deps import jobs, require_key
 
-router = APIRouter(prefix="/api/map", tags=["map"], dependencies=[Depends(require_key)])
+router = APIRouter(prefix="/api/map",
+                   tags=["map"], dependencies=[Depends(require_key)])
+geolocator = Nominatim(user_agent="homelander")
 
 
 def links(package_id: str) -> ArtifactPaths:
@@ -94,7 +97,8 @@ async def get_package(package_id: str, service=Depends(jobs)):
     try:
         return package(service.get_package(package_id))
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="package not found") from exc
+        raise HTTPException(
+            status_code=404, detail="package not found") from exc
 
 
 @router.get("/packages/{package_id}/artifacts/{artifact_name}")
@@ -106,10 +110,12 @@ async def get_package_artifact(package_id: str, artifact_name: str, service=Depe
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except KeyError as exc:
-        detail = "artifact not found" if str(exc).strip("'") == f"artifact:{artifact_name}" else "package not found"
+        detail = "artifact not found" if str(exc).strip(
+            "'") == f"artifact:{artifact_name}" else "package not found"
         raise HTTPException(status_code=404, detail=detail) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="artifact file not found") from exc
+        raise HTTPException(
+            status_code=404, detail="artifact file not found") from exc
     return FileResponse(path)
 
 
@@ -154,7 +160,8 @@ async def get_job_artifact(job_id: str, artifact_name: str, service=Depends(jobs
 
     job = service.get_job(job_id)
     if job.result is None:
-        raise HTTPException(status_code=409, detail="job result is not available")
+        raise HTTPException(
+            status_code=409, detail="job result is not available")
 
     artifact = {
         "mbtiles": job.result.artifacts.mbtiles,
@@ -190,3 +197,9 @@ async def stream_job(job_id: str, service=Depends(jobs)):
             yield json.dumps({"event": "error", "detail": "job not found", "status_code": 404}) + "\n"
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
+
+
+@router.get("/address")
+async def get_address(lat: float, lon: float) -> str:
+    location = geolocator.reverse(f"{lat}, {lon}")
+    return location or ""
