@@ -29,6 +29,7 @@ def links(package_id: str) -> ArtifactPaths:
         region_pbf=f"/api/map/packages/{package_id}/artifacts/region_pbf",
         mbtiles=f"/api/map/packages/{package_id}/artifacts/mbtiles",
         graph=f"/api/map/packages/{package_id}/artifacts/graph",
+        addresses=f"/api/map/packages/{package_id}/artifacts/addresses",
         meta=f"/api/map/packages/{package_id}/artifacts/meta",
     )
 
@@ -166,6 +167,7 @@ async def get_job_artifact(job_id: str, artifact_name: str, service=Depends(jobs
     artifact = {
         "mbtiles": job.result.artifacts.mbtiles,
         "graph": job.result.artifacts.graph,
+        "addresses": job.result.artifacts.addresses,
         "meta": job.result.artifacts.meta,
         "region_pbf": job.result.artifacts.region_pbf,
     }.get(artifact_name)

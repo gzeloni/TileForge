@@ -3,6 +3,7 @@
 from app.services.graph import GraphBuilder
 from app.services.jobs import InlineMapJobService, RQMapJobService, job_service
 from app.services.maps import (
+    AddressIndexBuilder,
     CacheStore,
     CommandMbtilesBuilder,
     CompositeRegionPackageBuilder,
@@ -20,6 +21,7 @@ from app.services.sync import (
 )
 
 __all__ = [
+    "AddressIndexBuilder",
     "CacheStore",
     "CommandMbtilesBuilder",
     "CompositeRegionPackageBuilder",

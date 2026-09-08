@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from app.api import make_app
 from app.helpers.model import MapArea
 from app.services.jobs import InlineMapJobService
 from app.services.maps import (
+    AddressIndexBuilder,
     ArtifactStageStore,
     CacheStore,
     CommandMbtilesBuilder,
@@ -43,6 +45,9 @@ class FakeRegionPackageBuilder:
             json.dumps({"road_types": ["residential"], "nodes": [], "edges": []}),
             encoding="utf-8",
         )
+        with sqlite3.connect(output_dir / "addresses.sqlite3") as connection:
+            connection.execute("CREATE TABLE addresses (id INTEGER PRIMARY KEY)")
+            connection.commit()
         if reporter:
             reporter("mbtiles", "Writing MBTiles")
 
@@ -130,6 +135,9 @@ class CacheStoreTests(unittest.TestCase):
             (package_dir / "region.osm.pbf").write_bytes(b"pbf")
             (package_dir / "map.mbtiles").write_bytes(b"mbtiles")
             (package_dir / "graph.json").write_text("{}", encoding="utf-8")
+            with sqlite3.connect(package_dir / "addresses.sqlite3") as connection:
+                connection.execute("CREATE TABLE addresses (id INTEGER PRIMARY KEY)")
+                connection.commit()
             (package_dir / "meta.json").write_text(
                 json.dumps(
                     {
@@ -140,6 +148,7 @@ class CacheStoreTests(unittest.TestCase):
                             "region_pbf": "region.osm.pbf",
                             "mbtiles": "map.mbtiles",
                             "graph": "graph.json",
+                            "addresses": "addresses.sqlite3",
                         },
                     }
                 ),
@@ -334,6 +343,10 @@ class MapApiTests(unittest.TestCase):
                 submitted.json()["artifacts"]["mbtiles"],
                 f"/api/map/packages/{submitted.json()['package_id']}/artifacts/mbtiles",
             )
+            self.assertEqual(
+                submitted.json()["artifacts"]["addresses"],
+                f"/api/map/packages/{submitted.json()['package_id']}/artifacts/addresses",
+            )
             for _ in range(10):
                 status = client.get(
                     f"/api/map/packages/{submitted.json()['package_id']}",
@@ -407,6 +420,10 @@ class MapApiTests(unittest.TestCase):
                 package_status.json()["artifacts"]["graph"],
                 f"/api/map/packages/{package_id}/artifacts/graph",
             )
+            self.assertEqual(
+                package_status.json()["artifacts"]["addresses"],
+                f"/api/map/packages/{package_id}/artifacts/addresses",
+            )
 
     def test_downloads_mbtiles_artifact_from_package_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -472,6 +489,80 @@ class MapApiTests(unittest.TestCase):
 
             self.assertEqual(artifact.status_code, 200)
             self.assertEqual(artifact.content, b"mbtiles")
+
+    def test_downloads_addresses_artifact_from_package_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "sources.json"
+            source_path = root / "south-america.osm.pbf"
+            source_path.write_bytes(b"south")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "source_id": "south-america",
+                                "path": str(source_path),
+                                "bounds": {
+                                    "west": -92.0,
+                                    "south": -57.0,
+                                    "east": -27.0,
+                                    "north": 15.0,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry = SourceRegistry.from_file(manifest_path)
+            cache_store = CacheStore(root / "cache", ttl=timedelta(hours=12))
+            builder = FakeRegionPackageBuilder()
+            map_service = MapService(
+                source_registry=registry,
+                cache_store=cache_store,
+                package_builder=builder,
+                pipeline_version="test-v1",
+            )
+            service = InlineMapJobService(map_service=map_service)
+            client = TestClient(make_app(service=service, api_key=self.API_KEY))
+
+            submitted = client.post(
+                "/api/map/packages",
+                json={
+                    "west": -46.70,
+                    "south": -23.62,
+                    "east": -46.56,
+                    "north": -23.50,
+                },
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+            package_id = submitted.json()["package_id"]
+            for _ in range(10):
+                status = client.get(
+                    f"/api/map/packages/{package_id}",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                )
+                if status.json()["status"] == "ready":
+                    break
+
+            artifact = client.get(
+                f"/api/map/packages/{package_id}/artifacts/addresses",
+                headers={"Authorization": f"Bearer {self.API_KEY}"},
+            )
+
+            self.assertEqual(artifact.status_code, 200)
+            artifact_path = root / "downloaded-addresses.sqlite3"
+            artifact_path.write_bytes(artifact.content)
+            with sqlite3.connect(artifact_path) as connection:
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            self.assertIn("addresses", tables)
 
     def test_different_min_zoom_creates_different_package(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -618,6 +709,7 @@ class MapApiTests(unittest.TestCase):
             self.assertEqual(status.json()["status"], "succeeded")
             self.assertEqual(builder.calls, 1)
             self.assertTrue(Path(status.json()["result"]["artifacts"]["mbtiles"]).exists())
+            self.assertTrue(Path(status.json()["result"]["artifacts"]["addresses"]).exists())
 
     def test_stream_endpoint_emits_progress_and_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1017,6 +1109,59 @@ class MapApiTests(unittest.TestCase):
             self.assertEqual(artifact.content, b"mbtiles")
 
 
+class AddressIndexBuilderTests(unittest.TestCase):
+    def test_builds_sqlite_index_from_node_and_way_addresses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            osm_path = root / "input.osm"
+            pbf_path = root / "input.osm.pbf"
+            db_path = root / "addresses.sqlite3"
+            osm_path.write_text(
+                """<?xml version='1.0' encoding='UTF-8'?>
+<osm version="0.6" generator="test">
+  <node id="1" lat="-25.4300" lon="-49.2700" />
+  <node id="2" lat="-25.4310" lon="-49.2710" />
+  <node id="3" lat="-25.4320" lon="-49.2720" />
+  <node id="10" lat="-25.4305" lon="-49.2715">
+    <tag k="addr:street" v="Rua das Flores" />
+    <tag k="addr:housenumber" v="100" />
+    <tag k="addr:city" v="Curitiba" />
+  </node>
+  <way id="20">
+    <nd ref="1" />
+    <nd ref="2" />
+    <nd ref="3" />
+    <tag k="addr:street" v="Avenida Brasil" />
+    <tag k="addr:housenumber" v="200" />
+    <tag k="addr:city" v="Curitiba" />
+  </way>
+</osm>
+""",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["osmium", "cat", str(osm_path), "-o", str(pbf_path), "--overwrite"],
+                check=True,
+            )
+
+            AddressIndexBuilder().build(
+                pbf_path,
+                db_path,
+                MapArea(west=-49.273, south=-25.433, east=-49.269, north=-25.430),
+            )
+
+            with sqlite3.connect(db_path) as connection:
+                rows = connection.execute(
+                    "SELECT osm_type, osm_id, street, house_number, city, display_name FROM addresses ORDER BY osm_type, osm_id"
+                ).fetchall()
+                metadata = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
+
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][:5], ("node", 10, "Rua das Flores", "100", "Curitiba"))
+            self.assertEqual(rows[1][:5], ("way", 20, "Avenida Brasil", "200", "Curitiba"))
+            self.assertEqual(metadata["schema_version"], "1")
+
+
 class CompositeRegionPackageBuilderTests(unittest.TestCase):
     def test_runs_all_build_steps(self) -> None:
         calls: list[str] = []
@@ -1037,6 +1182,13 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
                 calls.append("graph")
                 output_path.write_text("{}", encoding="utf-8")
 
+        class AddressBuilder:
+            def build(self, input_path: Path, output_path: Path, area: MapArea, reporter=None) -> None:
+                calls.append("addresses")
+                with sqlite3.connect(output_path) as connection:
+                    connection.execute("CREATE TABLE addresses (id INTEGER PRIMARY KEY)")
+                    connection.commit()
+
         class MbtilesBuilder:
             def build(
                 self,
@@ -1051,6 +1203,7 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
         builder = CompositeRegionPackageBuilder(
             extractor=Extractor(),
             graph_builder=GraphBuilder(),
+            address_builder=AddressBuilder(),
             mbtiles_builder=MbtilesBuilder(),
         )
 
@@ -1066,13 +1219,14 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
                 output_dir,
             )
 
-            self.assertEqual(calls, ["extract", "graph", "mbtiles"])
+            self.assertEqual(calls, ["extract", "graph", "mbtiles", "addresses"])
             self.assertTrue((output_dir / "region.osm.pbf").exists())
             self.assertTrue((output_dir / "graph.json").exists())
+            self.assertTrue((output_dir / "addresses.sqlite3").exists())
             self.assertTrue((output_dir / "map.mbtiles").exists())
 
     def test_reuses_extract_and_graph_for_different_min_zoom(self) -> None:
-        calls = {"extract": 0, "graph": 0, "mbtiles": 0}
+        calls = {"extract": 0, "graph": 0, "mbtiles": 0, "addresses": 0}
 
         class Extractor:
             def extract(self, source_path: Path, area: MapArea, output_path: Path, reporter=None) -> None:
@@ -1083,6 +1237,13 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
             def build(self, input_path: Path, output_path: Path, area: MapArea) -> None:
                 calls["graph"] += 1
                 output_path.write_text("{}", encoding="utf-8")
+
+        class AddressBuilder:
+            def build(self, input_path: Path, output_path: Path, area: MapArea, reporter=None) -> None:
+                calls["addresses"] += 1
+                with sqlite3.connect(output_path) as connection:
+                    connection.execute("CREATE TABLE addresses (id INTEGER PRIMARY KEY)")
+                    connection.commit()
 
         class MbtilesBuilder:
             def build(self, input_path: Path, output_path: Path, area: MapArea, reporter=None) -> None:
@@ -1097,6 +1258,7 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
             builder = CompositeRegionPackageBuilder(
                 extractor=Extractor(),
                 graph_builder=GraphBuilder(),
+                address_builder=AddressBuilder(),
                 mbtiles_builder=MbtilesBuilder(),
                 artifact_store=artifact_store,
                 parallel_tasks=2,
@@ -1116,9 +1278,10 @@ class CompositeRegionPackageBuilderTests(unittest.TestCase):
                 second_output,
             )
 
-            self.assertEqual(calls, {"extract": 1, "graph": 1, "mbtiles": 2})
+            self.assertEqual(calls, {"extract": 1, "graph": 1, "mbtiles": 2, "addresses": 1})
             self.assertTrue((first_output / "region.osm.pbf").exists())
             self.assertTrue((second_output / "graph.json").exists())
+            self.assertTrue((second_output / "addresses.sqlite3").exists())
 
 
 class CommandMbtilesBuilderTests(unittest.TestCase):
@@ -1265,6 +1428,7 @@ class BuildDefaultServiceTests(unittest.TestCase):
             )
             self.assertEqual(service.package_builder.extractor.strategy, "smart")
             self.assertEqual(service.package_builder.graph_builder.location_index, "flex_mem")
+            self.assertEqual(service.package_builder.address_builder.location_index, "flex_mem")
             self.assertEqual(service.package_builder.parallel_tasks, 1)
 
     def test_reads_osmium_location_index_from_environment(self) -> None:
@@ -1302,6 +1466,7 @@ class BuildDefaultServiceTests(unittest.TestCase):
                 service = map_service()
 
             self.assertEqual(service.package_builder.graph_builder.location_index, "sparse_file_array")
+            self.assertEqual(service.package_builder.address_builder.location_index, "sparse_file_array")
 
     def test_reads_osmium_extract_strategy_and_tilemaker_store_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

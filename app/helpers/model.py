@@ -33,6 +33,7 @@ class ArtifactPaths(BaseModel):
     region_pbf: str
     mbtiles: str
     graph: str
+    addresses: str
     meta: str
 
 

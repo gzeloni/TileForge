@@ -78,6 +78,7 @@ def _package_payload_from_meta(
             "region_pbf": str(package_dir / "region.osm.pbf"),
             "mbtiles": str(package_dir / "map.mbtiles"),
             "graph": str(package_dir / "graph.json"),
+            "addresses": str(package_dir / "addresses.sqlite3"),
             "meta": str(package_dir / "meta.json"),
         },
     }

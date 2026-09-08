@@ -5,7 +5,9 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import errno
+import sqlite3
 import shutil
 import subprocess
 import shlex
@@ -16,6 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import unquote
 
 from app.helpers.model import ArtifactPaths, MapArea, MapPackageResponse
 from app.services.graph import GraphBuilder
@@ -232,6 +235,7 @@ class CacheStore:
             artifacts.get("region_pbf"),
             artifacts.get("mbtiles"),
             artifacts.get("graph"),
+            artifacts.get("addresses"),
         ]
         if any(not name for name in required):
             return False
@@ -324,6 +328,28 @@ class ArtifactStageStore:
             self._remove_dir(build_dir)
             build_dir.mkdir(parents=True, exist_ok=True)
             graph_builder.build(region_path, build_dir / "graph.json", area)
+            self._promote(build_dir, stage_dir)
+        return artifact_path
+
+    def materialize_addresses(
+        self,
+        source: SourceDefinition,
+        area: MapArea,
+        region_path: Path,
+        address_builder,
+        reporter=None,
+    ) -> Path:
+        stage_dir = self.root / "addresses" / source.source_id / self._stage_key("addresses", source, area)
+        artifact_path = stage_dir / "addresses.sqlite3"
+        with self._lock(stage_dir):
+            if artifact_path.exists():
+                _report(reporter, "addresses", "Reusing address index artifact")
+                return artifact_path
+
+            build_dir = self._build_dir_for(stage_dir)
+            self._remove_dir(build_dir)
+            build_dir.mkdir(parents=True, exist_ok=True)
+            address_builder.build(region_path, build_dir / "addresses.sqlite3", area, reporter=reporter)
             self._promote(build_dir, stage_dir)
         return artifact_path
 
@@ -448,17 +474,219 @@ class CommandMbtilesBuilder:
         return config_path
 
 
+class AddressIndexBuilder:
+    def __init__(self, binary: str = "osmium", location_index: str = "flex_mem") -> None:
+        self.binary = binary
+        self.location_index = location_index
+
+    def build(self, input_path: Path, output_path: Path, area: MapArea, reporter=None) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists():
+            output_path.unlink()
+
+        with sqlite3.connect(output_path) as connection:
+            self._create_schema(connection)
+            self._write_metadata(connection, input_path, area)
+            connection.executemany(
+                '''
+                INSERT INTO addresses (
+                    osm_type,
+                    osm_id,
+                    lat,
+                    lon,
+                    display_name,
+                    name,
+                    street,
+                    place,
+                    house_number,
+                    neighbourhood,
+                    suburb,
+                    city,
+                    state,
+                    postcode,
+                    country,
+                    raw_tags
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                self._iter_address_rows(input_path, area, reporter=reporter),
+            )
+            connection.commit()
+
+    def _create_schema(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            '''
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE addresses (
+                osm_type TEXT NOT NULL,
+                osm_id INTEGER NOT NULL,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                display_name TEXT NOT NULL,
+                name TEXT,
+                street TEXT,
+                place TEXT,
+                house_number TEXT,
+                neighbourhood TEXT,
+                suburb TEXT,
+                city TEXT,
+                state TEXT,
+                postcode TEXT,
+                country TEXT,
+                raw_tags TEXT NOT NULL,
+                PRIMARY KEY (osm_type, osm_id)
+            );
+
+            CREATE INDEX idx_addresses_lat_lon ON addresses (lat, lon);
+            CREATE INDEX idx_addresses_display_name ON addresses (display_name);
+            '''
+        )
+
+    def _write_metadata(
+        self,
+        connection: sqlite3.Connection,
+        input_path: Path,
+        area: MapArea,
+    ) -> None:
+        metadata = [
+            ("schema_version", "1"),
+            ("created_at", datetime.now(UTC).isoformat()),
+            ("source_path", str(input_path)),
+            ("west", f"{area.west:.6f}"),
+            ("south", f"{area.south:.6f}"),
+            ("east", f"{area.east:.6f}"),
+            ("north", f"{area.north:.6f}"),
+        ]
+        connection.executemany(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
+            metadata,
+        )
+
+    def _iter_address_rows(self, input_path: Path, area: MapArea, reporter=None):
+        _report(reporter, "addresses", "Building address index")
+        for element in self._iter_address_elements(input_path):
+            if not _point_in_area(element["lat"], element["lon"], area):
+                continue
+            address_tags = _address_tags(element["tags"])
+            if not address_tags:
+                continue
+            yield (
+                element["osm_type"],
+                element["osm_id"],
+                round(element["lat"], 6),
+                round(element["lon"], 6),
+                _display_name_from_address_tags(address_tags),
+                element["tags"].get("name"),
+                address_tags.get("addr:street"),
+                address_tags.get("addr:place"),
+                address_tags.get("addr:housenumber"),
+                address_tags.get("addr:neighbourhood"),
+                address_tags.get("addr:suburb"),
+                address_tags.get("addr:city"),
+                address_tags.get("addr:state"),
+                address_tags.get("addr:postcode"),
+                address_tags.get("addr:country"),
+                json.dumps(address_tags, sort_keys=True),
+            )
+
+    def _iter_address_elements(self, input_path: Path):
+        with self._location_index_arg() as location_index:
+            command = [
+                self.binary,
+                "add-locations-to-ways",
+                "--no-progress",
+                "--ignore-missing-nodes",
+                "--index-type",
+                location_index,
+                "-f",
+                "opl,add_metadata=false",
+                str(input_path),
+            ]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            assert process.stderr is not None
+
+            try:
+                for raw_line in process.stdout:
+                    line = raw_line.strip()
+                    if not line or line[0] not in {"n", "w"}:
+                        continue
+
+                    fields = _parse_opl_fields(line)
+                    tags = _parse_tags(fields.get("T", ""))
+                    if not _address_tags(tags):
+                        continue
+
+                    if line[0] == "n":
+                        lon = fields.get("x")
+                        lat = fields.get("y")
+                        if lon is None or lat is None:
+                            continue
+                        yield {
+                            "osm_type": "node",
+                            "osm_id": int(line.split(" ", 1)[0][1:]),
+                            "lat": float(lat),
+                            "lon": float(lon),
+                            "tags": tags,
+                        }
+                        continue
+
+                    points = _parse_way_points(fields.get("N", ""))
+                    if not points:
+                        continue
+                    lat, lon = _centroid(points)
+                    yield {
+                        "osm_type": "way",
+                        "osm_id": int(line.split(" ", 1)[0][1:]),
+                        "lat": lat,
+                        "lon": lon,
+                        "tags": tags,
+                    }
+            finally:
+                stderr = process.stderr.read()
+                return_code = process.wait()
+                process.stdout.close()
+                process.stderr.close()
+                if return_code != 0:
+                    raise subprocess.CalledProcessError(
+                        return_code,
+                        command,
+                        output=None,
+                        stderr=stderr,
+                    )
+
+    @contextmanager
+    def _location_index_arg(self):
+        if "," in self.location_index or not self.location_index.endswith("_file_array"):
+            yield self.location_index
+            return
+
+        with tempfile.TemporaryDirectory(prefix="osmium-index-") as tmp:
+            yield f"{self.location_index},{Path(tmp) / 'locations.idx'}"
+
+
 class CompositeRegionPackageBuilder:
     def __init__(
         self,
         extractor,
         graph_builder,
+        address_builder,
         mbtiles_builder,
         artifact_store: ArtifactStageStore | None = None,
         parallel_tasks: int = 1,
     ) -> None:
         self.extractor = extractor
         self.graph_builder = graph_builder
+        self.address_builder = address_builder
         self.mbtiles_builder = mbtiles_builder
         self.artifact_store = artifact_store
         self.parallel_tasks = max(1, parallel_tasks)
@@ -473,6 +701,7 @@ class CompositeRegionPackageBuilder:
         output_dir.mkdir(parents=True, exist_ok=True)
         region_path = output_dir / "region.osm.pbf"
         graph_path = output_dir / "graph.json"
+        addresses_path = output_dir / "addresses.sqlite3"
         mbtiles_path = output_dir / "map.mbtiles"
         stage_region_path = region_path
         if self.artifact_store is not None:
@@ -504,6 +733,19 @@ class CompositeRegionPackageBuilder:
             _report(reporter, "mbtiles", "Building MBTiles")
             self.mbtiles_builder.build(stage_region_path, mbtiles_path, area, reporter=reporter)
 
+        def build_addresses() -> Path:
+            _report(reporter, "addresses", "Building address index")
+            if self.artifact_store is None:
+                self.address_builder.build(stage_region_path, addresses_path, area, reporter=reporter)
+                return addresses_path
+            return self.artifact_store.materialize_addresses(
+                source=source,
+                area=area,
+                region_path=stage_region_path,
+                address_builder=self.address_builder,
+                reporter=reporter,
+            )
+
         if self.parallel_tasks > 1:
             with ThreadPoolExecutor(max_workers=min(2, self.parallel_tasks)) as executor:
                 graph_future = executor.submit(build_graph)
@@ -513,11 +755,14 @@ class CompositeRegionPackageBuilder:
         else:
             staged_graph_path = build_graph()
             build_mbtiles()
+        staged_addresses_path = build_addresses()
 
         if stage_region_path != region_path:
             _link_or_copy(stage_region_path, region_path)
         if staged_graph_path != graph_path:
             _link_or_copy(staged_graph_path, graph_path)
+        if staged_addresses_path != addresses_path:
+            _link_or_copy(staged_addresses_path, addresses_path)
 
 class MapService:
     def __init__(
@@ -649,6 +894,7 @@ class MapService:
                 "region_pbf": "region.osm.pbf",
                 "mbtiles": "map.mbtiles",
                 "graph": "graph.json",
+                "addresses": "addresses.sqlite3",
             },
         }
         (package_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
@@ -671,6 +917,7 @@ class MapService:
                 region_pbf=str(package_dir / "region.osm.pbf"),
                 mbtiles=str(package_dir / "map.mbtiles"),
                 graph=str(package_dir / "graph.json"),
+                addresses=str(package_dir / "addresses.sqlite3"),
                 meta=str(package_dir / "meta.json"),
             ),
         )
@@ -685,7 +932,7 @@ def map_service() -> MapService:
     )
     ttl_hours = int(os.getenv("CACHE_TTL_HOURS", "1"))
     snap_degrees = float(os.getenv("CACHE_KEY_SNAP_DEGREES", "0.001"))
-    pipeline_version = os.getenv("PIPELINE_VERSION", "v2-smart-extract")
+    pipeline_version = os.getenv("PIPELINE_VERSION", "v3-address-index")
     scratch_root = Path(
         os.getenv(
             "BUILD_SCRATCH_ROOT",
@@ -733,6 +980,10 @@ def map_service() -> MapService:
                 strategy=osmium_extract_strategy,
             ),
             graph_builder=GraphBuilder(
+                binary=os.getenv("OSMIUM_BINARY", "osmium"),
+                location_index=osmium_location_index,
+            ),
+            address_builder=AddressIndexBuilder(
                 binary=os.getenv("OSMIUM_BINARY", "osmium"),
                 location_index=osmium_location_index,
             ),
@@ -814,6 +1065,91 @@ def _run_command(command: list[str], reporter=None, step: str | None = None) -> 
     return_code = process.wait()
     if return_code != 0:
         raise subprocess.CalledProcessError(return_code, command)
+
+
+def _parse_opl_fields(line: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for raw_field in line.split(" ")[1:]:
+        if not raw_field:
+            continue
+        fields[raw_field[0]] = raw_field[1:]
+    return fields
+
+
+def _parse_tags(raw_tags: str) -> dict[str, str]:
+    if not raw_tags:
+        return {}
+
+    tags: dict[str, str] = {}
+    for item in raw_tags.split(","):
+        key, separator, value = item.partition("=")
+        if not separator:
+            continue
+        tags[_decode_opl_string(key)] = _decode_opl_string(value)
+    return tags
+
+
+def _decode_opl_string(raw_value: str) -> str:
+    normalized = re.sub(r"%([0-9A-Fa-f]{2})%", r"%\1", raw_value)
+    return unquote(normalized)
+
+
+def _parse_way_points(raw_nodes: str) -> list[tuple[int, float, float]]:
+    points: list[tuple[int, float, float]] = []
+    for raw_node in raw_nodes.split(","):
+        node_ref, _, remainder = raw_node.partition("x")
+        if not remainder or not node_ref.startswith("n"):
+            continue
+        lon, separator, lat = remainder.partition("y")
+        if not separator:
+            continue
+        points.append((int(node_ref[1:]), float(lat), float(lon)))
+    return points
+
+
+def _centroid(points: list[tuple[int, float, float]]) -> tuple[float, float]:
+    lat_sum = sum(point[1] for point in points)
+    lon_sum = sum(point[2] for point in points)
+    size = len(points)
+    return lat_sum / size, lon_sum / size
+
+
+def _point_in_area(lat: float, lon: float, area: MapArea) -> bool:
+    return area.west <= lon <= area.east and area.south <= lat <= area.north
+
+
+def _address_tags(tags: dict[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in tags.items()
+        if key.startswith("addr:") and value
+    }
+
+
+def _display_name_from_address_tags(tags: dict[str, str]) -> str:
+    street = tags.get("addr:street") or tags.get("addr:place")
+    house_number = tags.get("addr:housenumber")
+    parts: list[str] = []
+    if street and house_number:
+        parts.append(f"{street}, {house_number}")
+    elif street:
+        parts.append(street)
+    elif house_number:
+        parts.append(house_number)
+
+    for key in (
+        "addr:neighbourhood",
+        "addr:suburb",
+        "addr:city",
+        "addr:state",
+        "addr:postcode",
+        "addr:country",
+    ):
+        value = tags.get(key)
+        if value:
+            parts.append(value)
+
+    return ", ".join(parts) if parts else "address"
 
 
 def _load_source_registry(
